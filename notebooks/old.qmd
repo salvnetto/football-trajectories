@@ -1,5 +1,9 @@
+---
+title: "Modelagem Espaçotemporal de Trajetórias no Futebol com Regiões Conformes"
+format: html
+---
 
-```{r}
+```{r setup, message=FALSE, warning=FALSE}
 library(torch)
 library(tidyverse)
 library(ggsoccer)
@@ -8,11 +12,12 @@ library(here)
 library(readr)
 library(ggforce)
 
+source(here("src", "modeling.R"))
 ```
 
-```{r}
+```{r reproducibility-device}
 # ==========================================
-# 0. REPRODUCIBILITY & DEVICE SETUP
+# 0. REPRODUCIBILIDADE & CONFIGURAÇÃO DO DISPOSITIVO
 # ==========================================
 set_seed <- function(seed = 42) {
   set.seed(seed)
@@ -23,31 +28,36 @@ get_device <- function() {
   if (cuda_is_available()) {
     return(torch_device("cuda"))
   } else if (backends_mps_is_available()) {
-    return(torch_device("mps")) # For Apple Silicon
+    return(torch_device("mps"))
   } else {
     return(torch_device("cpu"))
   }
 }
 ```
 
-```{r}
+```{r data-preprocessing}
 # ==========================================
-# 1. DATA PREPROCESSING
+# 1. PRÉ-PROCESSAMENTO & CONSTRUÇÃO DE GRAFOS
 # ==========================================
-preprocess_and_build_dataset <- function(df) {
-  # Force standard data.frame to prevent data.table subsetting errors
+
+# Função de colação customizada para lotes de tamanho 1 (preserva tipos e metadados R)
+custom_collate <- function(batch) {
+  batch[[1]]
+}
+
+preprocess_and_build_dataset <- function(df, 
+                                         train_prop = 0.60, 
+                                         val_prop = 0.15, 
+                                         calib_prop = 0.15, 
+                                         seed = 42) {
+  set.seed(seed)
   df <- as.data.frame(df)
 
-  # Label Encoding (Removed player_position)
+  # 1. Codificação Categórica Robusta
+  # team_code ("Attack" / "Defense") indica o papel tático na posse
   df <- df %>%
     mutate(
-      team_with_poss = case_when(
-        team_with_poss == team_id ~ team_code,
-        team_with_poss != team_id & team_code == "Attack" ~ "Defense",
-        team_with_poss != team_id & team_code == "Defense" ~ "Attack",
-        TRUE ~ NA_character_
-      ),
-      team_with_poss_idx = as.integer(as.factor(team_with_poss)),
+      role_idx = if_else(team_code == "Attack", 2L, 1L), # 1 = Defense, 2 = Attack
       team_id_idx = as.integer(as.factor(team_id))
     ) %>% 
     group_by(player_id, event_id) %>%
@@ -61,24 +71,40 @@ preprocess_and_build_dataset <- function(df) {
 
   encoders <- list(
     num_teams = max(df$team_id_idx, na.rm = TRUE),
-    num_poss_states = max(df$team_with_poss_idx, na.rm = TRUE)
+    num_roles = 2L
   )
 
-  # Standard Scaling (Includes x_ball and y_ball)
+  # 2. Particionamento por Jogada Independente (Sem Vazamento de Dados)
+  unique_events <- unique(df$event_id)
+  n_events <- length(unique_events)
+  shuffled_events <- sample(unique_events)
+
+  n_train <- floor(train_prop * n_events)
+  n_val <- floor(val_prop * n_events)
+  n_calib <- floor(calib_prop * n_events)
+
+  train_events <- shuffled_events[1:n_train]
+  val_events <- shuffled_events[(n_train + 1):(n_train + n_val)]
+  calib_events <- shuffled_events[(n_train + n_val + 1):(n_train + n_val + n_calib)]
+  test_events <- shuffled_events[(n_train + n_val + n_calib + 1):n_events]
+
+  # 3. Escalonamento Estatístico Estrito (Ajustado APENAS no Treino, t <= 25)
   cont_cols <- c('x', 'y', 'ball_speed', 'x_ball', 'y_ball', 'dist_to_ball', 'vel_x', 'vel_y')
+  train_obs <- df %>% filter(event_id %in% train_events, time_sec <= 25)
 
-  # Now this base R subsetting will work perfectly
-  scaler_center <- colMeans(df[, cont_cols], na.rm = TRUE)
-  scaler_scale <- apply(df[, cont_cols], 2, sd, na.rm = TRUE)
+  scaler_center <- colMeans(train_obs[, cont_cols], na.rm = TRUE)
+  scaler_scale <- apply(train_obs[, cont_cols], 2, sd, na.rm = TRUE)
+  scaler_scale[scaler_scale == 0] <- 1
 
+  # Padronização z-score das variáveis contínuas
   df[, cont_cols] <- scale(df[, cont_cols], center = scaler_center, scale = scaler_scale)
 
-  # Group by event_id and build graphs
+  # 4. Construção dos Grafos por Jogada
   event_list <- df %>% group_split(event_id)
   graphs <- list()
 
   for (event_df in event_list) {
-    event_id <- event_df$event_id[1]
+    evt_id <- event_df$event_id[1]
 
     obs_df <- event_df %>% filter(time_sec <= 25)
     target_df <- event_df %>% filter(time_sec >= 26 & time_sec <= 30)
@@ -86,29 +112,34 @@ preprocess_and_build_dataset <- function(df) {
     obs_counts <- table(obs_df$player_id)
     target_counts <- table(target_df$player_id)
 
-    # Find players with exactly 26 obs frames and 5 target frames
+    # Identificar jogadores presentes em todos os 25 frames observados e 5 alvos
     valid_players <- names(obs_counts)[obs_counts == 25]
     valid_players <- valid_players[valid_players %in% names(target_counts)]
     valid_players <- valid_players[target_counts[valid_players] == 5]
+    valid_players <- sort(valid_players)
 
     if (length(valid_players) < 2) next
 
     node_features_seq <- list()
     node_cat_features <- list()
     node_targets_seq <- list()
+    node_player_ids <- character()
+    node_team_codes <- character()
+    node_team_names <- character()
 
     for (pid in valid_players) {
       p_obs <- obs_df %>% filter(player_id == pid) %>% arrange(time_sec)
       p_tgt <- target_df %>% filter(player_id == pid) %>% arrange(time_sec)
 
-      node_features_seq[[length(node_features_seq) + 1]] <- as.matrix(p_obs[, c('x', 'y', 'ball_speed', 'x_ball', 'y_ball', 'dist_to_ball', 'vel_x', 'vel_y')])
-
-      # Removed player_position_idx here
-      node_cat_features[[length(node_cat_features) + 1]] <- as.integer(p_obs[1, c('team_id_idx', 'team_with_poss_idx')])
+      node_features_seq[[length(node_features_seq) + 1]] <- as.matrix(p_obs[, cont_cols])
+      node_cat_features[[length(node_cat_features) + 1]] <- as.integer(p_obs[1, c('team_id_idx', 'role_idx')])
       node_targets_seq[[length(node_targets_seq) + 1]] <- as.matrix(p_tgt[, c('x', 'y')])
+
+      node_player_ids <- c(node_player_ids, pid)
+      node_team_codes <- c(node_team_codes, p_obs$team_code[1])
+      node_team_names <- c(node_team_names, p_obs$team_name[1])
     }
 
-    # Convert to tensors
     x_cont <- torch_tensor(abind::abind(node_features_seq, along = 0), dtype = torch_float())
     x_cat <- torch_tensor(do.call(rbind, node_cat_features), dtype = torch_long())
     y_tgt <- torch_tensor(abind::abind(node_targets_seq, along = 0), dtype = torch_float())
@@ -118,14 +149,33 @@ preprocess_and_build_dataset <- function(df) {
       x_cat = x_cat, 
       y = y_tgt, 
       num_nodes = length(valid_players),
-      event_id = event_id
+      event_id = evt_id,
+      player_ids = node_player_ids,
+      team_codes = node_team_codes,
+      team_names = node_team_names
     )
   }
 
-  list(graphs = graphs, encoders = encoders, scaler = list(center = scaler_center, scale = scaler_scale))
+  # Mapear eventos para índices de grafos
+  graph_event_ids <- sapply(graphs, function(g) g$event_id)
+  train_indices <- which(graph_event_ids %in% train_events)
+  val_indices <- which(graph_event_ids %in% val_events)
+  calib_indices <- which(graph_event_ids %in% calib_events)
+  test_indices <- which(graph_event_ids %in% test_events)
+
+  list(
+    graphs = graphs,
+    splits = list(
+      train = train_indices,
+      val = val_indices,
+      calib = calib_indices,
+      test = test_indices
+    ),
+    encoders = encoders,
+    scaler = list(center = scaler_center, scale = scaler_scale)
+  )
 }
 
-# Custom Dataset
 TrajectoryDataset <- dataset(
   name = "TrajectoryDataset",
   initialize = function(graphs) { self$graphs <- graphs },
@@ -134,86 +184,89 @@ TrajectoryDataset <- dataset(
 )
 ```
 
-```{r}
+```{r model-definition}
+# ==========================================
+# 2. ARQUITETURA DA REDE NEURAL (Seq2Seq + GNN)
+# ==========================================
 TrajectorySeq2SeqGNN <- nn_module(
   "TrajectorySeq2SeqGNN",
 
-  initialize = function(num_teams, num_poss_states, cont_dim = 8, hidden_dim = 64, dropout_rate = 0.2) {
-    # 1. Categorical Embeddings
-    self$team_emb <- nn_embedding(num_embeddings = num_teams + 1, embedding_dim = 4)
-    self$poss_emb <- nn_embedding(num_embeddings = num_poss_states + 1, embedding_dim = 4)
+  initialize = function(num_teams, num_roles = 2, cont_dim = 8, hidden_dim = 64, dropout_rate = 0.2, scaler = NULL) {
+    # 1. Embeddings Categóricos (Indexação base 1)
+    self$team_emb <- nn_embedding(num_embeddings = num_teams + 2, embedding_dim = 4)
+    self$role_emb <- nn_embedding(num_embeddings = num_roles + 2, embedding_dim = 4)
 
     input_dim <- cont_dim + 4 + 4
     self$feat_proj <- nn_linear(input_dim, hidden_dim)
 
-    # 2. SPATIAL LAYER (Graph Attention)
+    # 2. Camada Espacial (Graph Multi-Head Attention entre os nós a cada frame)
     self$spatial_attention <- nn_multihead_attention(embed_dim = hidden_dim, num_heads = 4, batch_first = TRUE)
     self$norm1 <- nn_layer_norm(hidden_dim)
     self$dropout1 <- nn_dropout(dropout_rate)
 
-    # 3. TEMPORAL ENCODER
-    self$temporal_encoder <- nn_lstm(input_size = hidden_dim, hidden_size = hidden_dim, 
-                                     batch_first = TRUE, bidirectional = FALSE)
+    # 3. Codificador Temporal (LSTM ao longo dos 25 frames históricos)
+    self$temporal_encoder <- nn_lstm(input_size = hidden_dim, hidden_size = hidden_dim, batch_first = TRUE)
 
-    # 4. AUTOREGRESSIVE DECODER COMPONENTS
-    # Input to decoder step: [pos_x, pos_y, vel_x, vel_y, global_ctx (hidden_dim)]
+    # 4. Decodificador Temporal Autoregressivo
+    # Entrada: [posição_atual (2), velocidade_atual (2), contexto_global (hidden_dim)]
     self$dec_input_proj <- nn_linear(2 + 2 + hidden_dim, hidden_dim)
     self$temporal_decoder <- nn_lstm(input_size = hidden_dim, hidden_size = hidden_dim, batch_first = TRUE)
 
-    # 5. OUTPUT LAYER
+    # 5. Camada de Saída: prediz o deslocamento no espaço de coordenadas padronizado
     self$out <- nn_sequential(
       nn_linear(hidden_dim, hidden_dim),
       nn_gelu(),
-      nn_linear(hidden_dim, 2) # Predicts velocity (change in position)
+      nn_linear(hidden_dim, 2)
     )
+
+    # Buffers para harmonização cinemática física entre deslocamento e escala de velocidade
+    if (!is.null(scaler)) {
+      self$sd_pos <- nn_buffer(torch_tensor(scaler$scale[c("x", "y")])$view(c(1, 2)))
+      self$sd_vel <- nn_buffer(torch_tensor(scaler$scale[c("vel_x", "vel_y")])$view(c(1, 2)))
+      self$mu_vel <- nn_buffer(torch_tensor(scaler$center[c("vel_x", "vel_y")])$view(c(1, 2)))
+    } else {
+      self$sd_pos <- nn_buffer(torch_ones(1, 2))
+      self$sd_vel <- nn_buffer(torch_ones(1, 2))
+      self$mu_vel <- nn_buffer(torch_zeros(1, 2))
+    }
   },
 
   forward = function(batch) {
-    x_cont <- batch$x_cont       
-    team_idx <- batch$x_cat[, 1] 
-    poss_idx <- batch$x_cat[, 2] 
+    x_cont <- batch$x_cont       # [num_nodes, seq_len = 25, cont_dim = 8]
+    team_idx <- batch$x_cat[, 1] # [num_nodes]
+    role_idx <- batch$x_cat[, 2] # [num_nodes]
 
     num_nodes <- x_cont$shape[1]
     seq_len <- x_cont$shape[2]
 
-    # Extract last known kinematics (Assuming indices 7 and 8 are vel_x and vel_y)
+    # Cinemática no último frame observado (t = 25)
     last_known_pos <- x_cont[, seq_len, 1:2] 
     last_known_vel <- x_cont[, seq_len, 7:8] 
 
     # Embeddings
     team_feat <- self$team_emb(team_idx)$unsqueeze(2)$expand(c(-1, seq_len, -1))
-    poss_feat <- self$poss_emb(poss_idx)$unsqueeze(2)$expand(c(-1, seq_len, -1))
+    role_feat <- self$role_emb(role_idx)$unsqueeze(2)$expand(c(-1, seq_len, -1))
 
-    x_in <- torch_cat(list(x_cont, team_feat, poss_feat), dim = 3)
+    x_in <- torch_cat(list(x_cont, team_feat, role_feat), dim = 3)
     x_proj <- self$feat_proj(x_in) 
 
-    # ==========================================
-    # SPATIAL LAYER
-    # ==========================================
-    x_spatial_in <- x_proj$transpose(1, 2) 
+    # Camada Espacial: Atenção entre jogadores a cada instante
+    x_spatial_in <- x_proj$transpose(1, 2) # [seq_len, num_nodes, hidden_dim]
     spatial_out <- self$spatial_attention(x_spatial_in, x_spatial_in, x_spatial_in)[[1]]
-
     x_spatio_temporal <- self$norm1(spatial_out$transpose(1, 2) + x_proj)
     x_spatio_temporal <- self$dropout1(x_spatio_temporal)
 
-    # ==========================================
-    # TEMPORAL ENCODER
-    # ==========================================
+    # Codificador Temporal
     enc_out <- self$temporal_encoder(x_spatio_temporal)
     enc_states <- enc_out[[1]] 
-    last_hidden <- enc_states[, seq_len, ] 
+    last_hidden <- enc_states[, seq_len, ] # [num_nodes, hidden_dim]
 
-    # ==========================================
-    # GLOBAL CONTEXT (Social Pooling)
-    # ==========================================
-    global_ctx <- last_hidden$max(dim = 1, keepdim = TRUE)[[1]] 
+    # Contexto Global (Social Max-Pooling invariante à permutação)
+    global_ctx <- last_hidden$max(dim = 1, keepdim = TRUE)[[1]] # [1, hidden_dim]
     global_ctx_exp <- global_ctx$expand(c(num_nodes, -1))
 
-    # ==========================================
-    # AUTOREGRESSIVE TEMPORAL DECODER
-    # ==========================================
-    # Initialize LSTM hidden states with the encoder's final state
-    h_t <- last_hidden$unsqueeze(1) # Shape: [1, num_nodes, hidden_dim]
+    # Decodificador Temporal Autoregressivo (5 passos no futuro)
+    h_t <- last_hidden$unsqueeze(1) # [1, num_nodes, hidden_dim]
     c_t <- torch_zeros_like(h_t)
     hx <- list(h_t, c_t)
 
@@ -222,40 +275,34 @@ TrajectorySeq2SeqGNN <- nn_module(
 
     preds <- list()
 
-    # Loop step-by-step for the 5 future frames
     for (t in 1:5) {
-      # 1. Combine current kinematics with global context
       step_in <- torch_cat(list(current_pos, current_vel, global_ctx_exp), dim = 2)
-      step_in <- self$dec_input_proj(step_in)$unsqueeze(2) # Shape: [num_nodes, 1, hidden_dim]
+      step_in <- self$dec_input_proj(step_in)$unsqueeze(2)
 
-      # 2. Pass through Decoder LSTM
       dec_out <- self$temporal_decoder(step_in, hx)
-      dec_hidden <- dec_out[[1]] # Shape: [num_nodes, 1, hidden_dim]
-      hx <- dec_out[[2]]         # Update hidden states for the next loop iteration
+      dec_hidden <- dec_out[[1]]
+      hx <- dec_out[[2]]
 
-      # 3. Predict velocity (delta position)
-      pred_vel <- self$out(dec_hidden$squeeze(2)) # Shape: [num_nodes, 2]
+      pred_disp <- self$out(dec_hidden$squeeze(2)) # [num_nodes, 2]
 
-      # 4. Update kinematics for the next step
-      current_pos <- current_pos + pred_vel
-      current_vel <- pred_vel 
+      # Atualização da posição no espaço escalonado
+      current_pos <- current_pos + pred_disp
 
-      # 5. Store the predicted position
+      # Atualização fisicamente e dimensionalmente consistente da velocidade
+      current_vel <- (pred_disp * self$sd_pos - self$mu_vel) / self$sd_vel
+
       preds[[t]] <- current_pos$unsqueeze(2)
     }
 
-    # Concatenate all 5 steps into final output tensor
-    preds_tensor <- torch_cat(preds, dim = 2) # Shape: [num_nodes, 5, 2]
-
+    preds_tensor <- torch_cat(preds, dim = 2) # [num_nodes, 5, 2]
     return(preds_tensor)
   }
 )
 ```
 
-
-```{r}
+```{r training-components}
 # ==========================================
-# 3. EARLY STOPPING & TRAINING
+# 3. FUNÇÕES DE PERDA, EARLY STOPPING & TREINO
 # ==========================================
 compute_ade_loss_and_fde <- function(preds, targets, scaler) {
   mu <- c(scaler$center["x"], scaler$center["y"])
@@ -274,7 +321,6 @@ compute_ade_loss_and_fde <- function(preds, targets, scaler) {
   ade_loss <- distances$mean()
   seq_len <- distances$shape[2]
 
-  # Extract FDE as a tensor for backprop and as an item for evaluation
   fde_loss <- distances[, seq_len]$mean()
   fde <- fde_loss$item()
 
@@ -305,168 +351,218 @@ EarlyStopping <- R6Class("EarlyStopping",
   )
 )
 
-run_training <- function(df_raw, max_epochs = 100, patience = 10) {
-  set_seed(42)
+run_training <- function(df_raw, max_epochs = 100, patience = 10, lr = 0.001, seed = 42) {
+  set_seed(seed)
   device <- get_device()
 
-  prep_data <- preprocess_and_build_dataset(df_raw)
+  # 1. Pré-processamento com partição tripartite independente
+  prep_data <- preprocess_and_build_dataset(df_raw, seed = seed)
   graphs <- prep_data$graphs
+  splits <- prep_data$splits
   encoders <- prep_data$encoders
   scaler <- prep_data$scaler
 
-  num_graphs <- length(graphs)
-  indices <- sample(seq_len(num_graphs))
+  train_dataset <- TrajectoryDataset(graphs[splits$train])
+  val_dataset <- TrajectoryDataset(graphs[splits$val])
+  calib_dataset <- TrajectoryDataset(graphs[splits$calib])
+  test_dataset <- TrajectoryDataset(graphs[splits$test])
 
-  train_idx <- indices[1:floor(0.7 * num_graphs)]
-  val_idx <- indices[(floor(0.7 * num_graphs) + 1):floor(0.85 * num_graphs)]
-  test_idx <- indices[(floor(0.85 * num_graphs) + 1):num_graphs]
-
-  train_dataset <- TrajectoryDataset(graphs[train_idx])
-  val_dataset <- TrajectoryDataset(graphs[val_idx])
-  test_dataset <- TrajectoryDataset(graphs[test_idx])
-
-  train_loader <- dataloader(train_dataset, batch_size = 1, shuffle = TRUE)
-  val_loader <- dataloader(val_dataset, batch_size = 1, shuffle = FALSE)
-  test_loader <- dataloader(test_dataset, batch_size = 1, shuffle = FALSE)
+  train_loader <- dataloader(train_dataset, batch_size = 1, shuffle = TRUE, collate_fn = custom_collate)
+  val_loader <- dataloader(val_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
+  calib_loader <- dataloader(calib_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
+  test_loader <- dataloader(test_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
 
   model <- TrajectorySeq2SeqGNN(
     num_teams = encoders$num_teams,
-    num_poss_states = encoders$num_poss_states,
-    cont_dim = 8
+    num_roles = encoders$num_roles,
+    cont_dim = 8,
+    hidden_dim = 64,
+    dropout_rate = 0.2,
+    scaler = scaler
   )$to(device = device)
 
-  optimizer <- optim_adam(model$parameters, lr = 0.001, weight_decay = 1e-5)
+  optimizer <- optim_adam(model$parameters, lr = lr, weight_decay = 1e-5)
   scheduler <- lr_reduce_on_plateau(optimizer, mode = "min", factor = 0.5, patience = 2)
   early_stopping <- EarlyStopping$new(patience = patience)
 
+  cat(sprintf("Iniciando treinamento com %d jogadas de Treino | %d Validação | %d Calibração | %d Teste\n",
+              length(splits$train), length(splits$val), length(splits$calib), length(splits$test)))
+
   for (epoch in 1:max_epochs) {
     model$train()
+    train_ade <- 0
     train_fde <- 0
     total_nodes_train <- 0
 
     coro::loop(for (batch in train_loader) {
-      batch$x_cont <- batch$x_cont[1, , , ]$to(device = device)
-      batch$x_cat <- batch$x_cat[1, , ]$to(device = device)
-      batch$y <- batch$y[1, , , ]$to(device = device)
+      batch$x_cont <- batch$x_cont$to(device = device)
+      batch$x_cat <- batch$x_cat$to(device = device)
+      batch$y <- batch$y$to(device = device)
 
       optimizer$zero_grad()
       predictions <- model(batch)
       metrics <- compute_ade_loss_and_fde(predictions, batch$y, scaler)
 
-      # Combine ADE and FDE for loss to ensure intermediate steps are learned, but FDE is prioritized
       loss <- metrics$ade_loss + metrics$fde_loss
       loss$backward()
       nn_utils_clip_grad_norm_(model$parameters, max_norm = 1.0)
       optimizer$step()
 
-      num_nodes <- batch$num_nodes$item()
+      num_nodes <- batch$num_nodes
+      train_ade <- train_ade + metrics$ade_loss$item() * num_nodes
       train_fde <- train_fde + metrics$fde * num_nodes
       total_nodes_train <- total_nodes_train + num_nodes
     })
 
+    train_ade <- train_ade / total_nodes_train
     train_fde <- train_fde / total_nodes_train
 
     model$eval()
+    val_ade <- 0
     val_fde <- 0
     total_nodes_val <- 0
 
     with_no_grad({
       coro::loop(for (batch in val_loader) {
-        batch$x_cont <- batch$x_cont[1, , , ]$to(device = device)
-        batch$x_cat <- batch$x_cat[1, , ]$to(device = device)
-        batch$y <- batch$y[1, , , ]$to(device = device)
+        batch$x_cont <- batch$x_cont$to(device = device)
+        batch$x_cat <- batch$x_cat$to(device = device)
+        batch$y <- batch$y$to(device = device)
 
         predictions <- model(batch)
         metrics <- compute_ade_loss_and_fde(predictions, batch$y, scaler)
 
-        num_nodes <- batch$num_nodes$item()
+        num_nodes <- batch$num_nodes
+        val_ade <- val_ade + metrics$ade_loss$item() * num_nodes
         val_fde <- val_fde + metrics$fde * num_nodes
         total_nodes_val <- total_nodes_val + num_nodes
       })
     })
 
+    val_ade <- val_ade / total_nodes_val
     val_fde <- val_fde / total_nodes_val
 
-    # Scheduler and Early Stopping now monitor FDE
     scheduler$step(val_fde)
 
-    cat(sprintf("Epoch %03d | Train FDE: %.2f | Val FDE: %.2f\n", epoch, train_fde, val_fde))
+    if (epoch %% 5 == 0 || epoch == 1) {
+      cat(sprintf("Época %03d | Treino ADE: %.2f m, FDE: %.2f m | Val ADE: %.2f m, FDE: %.2f m\n", 
+                  epoch, train_ade, train_fde, val_ade, val_fde))
+    }
 
     early_stopping$step(val_fde, model)
-    if (early_stopping$early_stop) break
+    if (early_stopping$early_stop) {
+      cat(sprintf("Early stopping atingido na época %d.\n", epoch))
+      break
+    }
   }
 
+  # Restaurar os melhores pesos selecionados pela validação
   with_no_grad({
     for (i in seq_along(model$parameters)) {
       model$parameters[[i]]$copy_(early_stopping$best_model_wts[[i]])
     }
   })
 
-  return(list(model = model, test_dataset = test_dataset, val_loader = val_loader, scaler = scaler))
+  return(list(
+    model = model,
+    test_dataset = test_dataset,
+    calib_loader = calib_loader,
+    val_loader = val_loader,
+    scaler = scaler,
+    encoders = encoders,
+    splits = splits
+  ))
 }
+```
 
+```{r conformal-prediction}
 # ==========================================
-# 4. CONFORMAL PREDICTION (REGRESSION-SPLIT)
+# 4. PREDIÇÃO CONFORME SIMULTÂNEA (Izbicki 2026 / Diquigiovanni et al. 2022)
 # ==========================================
-
-calibrate_conformal <- function(model, val_loader, scaler, alpha = 0.1) {
+calibrate_conformal <- function(model, calib_loader, scaler, alpha = 0.10) {
   model$eval()
   device <- model$parameters[[1]]$device
 
-  # Prepare unscaling tensors
   mu <- c(scaler$center["x"], scaler$center["y"])
   sd <- c(scaler$scale["x"], scaler$scale["y"])
   mu_tensor <- torch_tensor(mu, device = device)$view(c(1, 1, 2))
   sd_tensor <- torch_tensor(sd, device = device)$view(c(1, 1, 2))
 
-  # We will store scores for each of the 5 future time steps separately
-  seq_len <- 5 
-  scores_per_step <- vector("list", seq_len)
+  all_player_errors <- list()
 
   with_no_grad({
-    coro::loop(for (batch in val_loader) {
-      # Format batch exactly as in the training loop
-      batch$x_cont <- batch$x_cont[1, , , ]$to(device = device)
-      batch$x_cat <- batch$x_cat[1, , ]$to(device = device)
-      batch$y <- batch$y[1, , , ]$to(device = device)
+    coro::loop(for (batch in calib_loader) {
+      batch$x_cont <- batch$x_cont$to(device = device)
+      batch$x_cat <- batch$x_cat$to(device = device)
+      batch$y <- batch$y$to(device = device)
 
-      # Get predictions
       preds <- model(batch)
 
-      # Unscale predictions and targets to real pitch coordinates
+      # Desnormalização para coordenadas físicas reais do campo (metros)
       preds_real <- preds * sd_tensor + mu_tensor
       y_true_real <- batch$y * sd_tensor + mu_tensor
 
-      # Calculate Euclidean distance (Non-conformity score)
       diff_sq <- (preds_real - y_true_real)$pow(2)
-      distances <- torch_sqrt(diff_sq$sum(dim = 3) + 1e-8) # Shape: [num_nodes, seq_len]
+      distances <- torch_sqrt(diff_sq$sum(dim = 3) + 1e-8) # [num_nodes, 5]
+      dist_mat <- as.matrix(distances$cpu())
 
-      # Convert to R matrix and store by time step
-      dist_matrix <- as.matrix(distances$cpu())
-      for(t in 1:seq_len) {
-        scores_per_step[[t]] <- c(scores_per_step[[t]], dist_matrix[, t])
-      }
+      all_player_errors[[length(all_player_errors) + 1]] <- dist_mat
     })
   })
 
-  # Calculate q_hat for each time step using the split-conformal formula
-  # q = ceiling((n + 1) * (1 - alpha)) / n
-  q_hats <- numeric(seq_len)
-  for(t in 1:seq_len) {
-    n <- length(scores_per_step[[t]])
-    q_level <- ceiling((n + 1) * (1 - alpha)) / n
-    q_level <- min(q_level, 1.0) # Cap at 1.0 for safety
+  err_matrix <- do.call(rbind, all_player_errors) # [total_trajetórias, 5]
+  n_players <- nrow(err_matrix)
+  n_events <- length(all_player_errors)
 
-    q_hats[t] <- quantile(scores_per_step[[t]], probs = q_level, names = FALSE)
+  # Passo 1: Forma temporal típica do erro s_hat (mediana dos erros a cada horizonte)
+  s_hat <- apply(err_matrix, 2, median)
+  s_hat[s_hat < 1e-4] <- 1e-4
+
+  # Passo 2: Escore de não-conformidade funcional supremo (Alvo B - por trajetória de jogador)
+  # R_i = max_{t in 1:5} (e_{i,t} / s_hat_t)
+  R_player <- apply(err_matrix, 1, function(row) max(row / s_hat))
+
+  # Passo 3: Quantil conforme com garantia exata em amostra finita
+  q_level_player <- min(1.0, ceiling((n_players + 1) * (1 - alpha)) / n_players)
+  q_hat_player <- quantile(R_player, probs = q_level_player, names = FALSE)
+
+  # Raios simultâneos ao longo dos 5 segundos
+  r_simultaneous <- q_hat_player * s_hat
+
+  # Escore por jogada completa (Alvo A - todas as trajetórias contidas na banda)
+  R_event <- sapply(all_player_errors, function(mat) {
+    max(apply(mat, 1, function(row) max(row / s_hat)))
+  })
+  q_level_event <- min(1.0, ceiling((n_events + 1) * (1 - alpha)) / n_events)
+  q_hat_event <- quantile(R_event, probs = q_level_event, names = FALSE)
+  r_event <- q_hat_event * s_hat
+
+  # Quantis pontuais marginais (apenas para contraste metodológico)
+  q_pointwise <- numeric(5)
+  for (t in 1:5) {
+    q_level_pw <- min(1.0, ceiling((n_players + 1) * (1 - alpha)) / n_players)
+    q_pointwise[t] <- quantile(err_matrix[, t], probs = q_level_pw, names = FALSE)
   }
 
-  cat(sprintf("Conformal Radii (alpha=%.2f) for steps 1 to 5:\n", alpha))
-  print(round(q_hats, 2))
+  cat(sprintf("\n=== CALIBRAÇÃO CONFORME RIGOROSA (alpha = %.2f) ===\n", alpha))
+  cat(sprintf("Amostra de Calibração: %d jogadas independentes (%d trajetórias)\n", n_events, n_players))
+  cat("Forma da banda s_hat (medianas em metros):", round(s_hat, 2), "\n")
+  cat(sprintf("Quantil Conforme Simultâneo (Alvo B): %.3f\n", q_hat_player))
+  cat("Raios Conformes Simultâneos (r_t em metros):", round(r_simultaneous, 2), "\n")
+  cat(sprintf("Quantil por Jogada Completa (Alvo A): %.3f\n", q_hat_event))
+  cat("Raios Marginais Pontuais (q_pw em metros):", round(q_pointwise, 2), "\n\n")
 
-  return(list(scores = scores_per_step, q_hats = q_hats, alpha = alpha))
+  return(list(
+    s_hat = s_hat,
+    q_hat_player = q_hat_player,
+    r_simultaneous = r_simultaneous,
+    q_hat_event = q_hat_event,
+    r_event = r_event,
+    r_pointwise = q_pointwise,
+    alpha = alpha
+  ))
 }
 
-predict_with_regions <- function(model, test_dataset, scaler, q_hats) {
+predict_with_regions <- function(model, dataset, scaler, r_t) {
   model$eval()
   device <- model$parameters[[1]]$device
 
@@ -475,306 +571,302 @@ predict_with_regions <- function(model, test_dataset, scaler, q_hats) {
   mu_tensor <- torch_tensor(mu, device = device)$view(c(1, 1, 2))
   sd_tensor <- torch_tensor(sd, device = device)$view(c(1, 1, 2))
 
-  test_loader <- dataloader(test_dataset, batch_size = 1, shuffle = FALSE)
+  loader <- dataloader(dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
   results_df <- list()
 
   with_no_grad({
-    coro::loop(for (batch in test_loader) {
-      event_id <- batch$event_id$item()
+    coro::loop(for (batch in loader) {
+      evt_id <- batch$event_id
+      player_ids <- batch$player_ids
+      team_codes <- batch$team_codes
+      team_names <- batch$team_names
 
-      batch$x_cont <- batch$x_cont[1, , , ]$to(device = device)
-      batch$x_cat <- batch$x_cat[1, , ]$to(device = device)
-      batch$y <- batch$y[1, , , ]$to(device = device)
+      batch$x_cont <- batch$x_cont$to(device = device)
+      batch$x_cat <- batch$x_cat$to(device = device)
+      batch$y <- batch$y$to(device = device)
 
       preds <- model(batch)
 
       preds_real <- preds * sd_tensor + mu_tensor
       y_true_real <- batch$y * sd_tensor + mu_tensor
 
-      preds_array <- as.array(preds_real$cpu())
-      y_true_array <- as.array(y_true_real$cpu())
+      preds_arr <- as.array(preds_real$cpu())
+      y_true_arr <- as.array(y_true_real$cpu())
 
-      num_nodes <- dim(preds_array)[1]
-      seq_len <- dim(preds_array)[2]
+      num_nodes <- dim(preds_arr)[1]
+      seq_len <- dim(preds_arr)[2]
 
-      # Flatten into a dataframe for easy plotting
       for (node in 1:num_nodes) {
+        pid <- player_ids[node]
+        tcode <- team_codes[node]
+        tname <- team_names[node]
+
         for (t in 1:seq_len) {
+          px <- preds_arr[node, t, 1]
+          py <- preds_arr[node, t, 2]
+          tx <- y_true_arr[node, t, 1]
+          ty <- y_true_arr[node, t, 2]
+          rad <- r_t[t]
+          dist <- sqrt((px - tx)^2 + (py - ty)^2)
+
           results_df[[length(results_df) + 1]] <- data.frame(
-            event_id = event_id,
+            event_id = evt_id,
             node_id = node,
+            player_id = pid,
+            team_code = tcode,
+            team_name = tname,
             time_step = t,
-            pred_x = preds_array[node, t, 1],
-            pred_y = preds_array[node, t, 2],
-            true_x = y_true_array[node, t, 1],
-            true_y = y_true_array[node, t, 2],
-            conf_radius = q_hats[t] # Assign the specific radius for this time step
+            pred_x = px,
+            pred_y = py,
+            true_x = tx,
+            true_y = ty,
+            conf_radius = rad,
+            distance = dist,
+            covered = dist <= rad,
+            stringsAsFactors = FALSE
           )
         }
       }
     })
   })
 
-  return(bind_rows(results_df))
+  bind_rows(results_df)
 }
 ```
 
-```{r}
+```{r visualization}
 # ==========================================
-# 5. PLOTTING CONFORMAL PREDICTION REGIONS
+# 5. VISUALIZAÇÃO GRÁFICA RIGOROSA NO CAMPO
 # ==========================================
-plot_conformal_event <- function(target_event_id, events_prepared, test_predictions) {
-  
-  # 1. Extract Historical Trajectories (Observation window: time_sec <= 25)
-  hist_data <- events_prepared %>%
-    filter(event_id == target_event_id, time_sec <= 25) %>%
-    # Calculate group logic to connect paths properly
-    arrange(player_id, time_sec)
-  
-  # 2. Extract Predictions & Conformal Radii for the specific event
+plot_conformal_event <- function(target_event_id, events_prepared, test_predictions, alpha = 0.10) {
   pred_data <- test_predictions %>%
     filter(event_id == target_event_id)
-  
-  # 3. Build the Plot
+
+  if (nrow(pred_data) == 0) {
+    stop(sprintf("Lance event_id %s não encontrado em test_predictions.", target_event_id))
+  }
+
+  valid_pids <- unique(pred_data$player_id)
+
+  # Trajetória histórica (últimos 5 frames observados t <= 25s) dos jogadores previstos
+  hist_data <- events_prepared %>%
+    filter(event_id == target_event_id, time_sec <= 25, player_id %in% valid_pids) %>%
+    arrange(player_id, time_sec)
+
   p <- ggplot() +
-    # Draw the pitch (Defaults to 105 x 68 which matches your variables)
+    # Geometria oficial do campo (105 x 68 m)
     annotate_pitch(
       dimensions = pitch_international,
-      fill       = NA,
-      colour     = "white", # White lines pop better against 'magma' colors
-      limits     = FALSE
+      fill = NA,
+      colour = "white",
+      limits = FALSE
     ) + 
     theme_pitch() +
-    theme(panel.background = element_rect(fill = "#222a35")) +
-    
-    # --- A. CONFORMAL REGIONS (Heatmap Tube) ---
-    # Using geom_circle with alpha to create a glowing heatmap effect.
-    # The radius maps perfectly to your unscaled q_hats.
-    geom_circle(data = pred_data,
-                aes(x0 = pred_x, y0 = pred_y, r = conf_radius, 
-                    fill = as.factor(time_step), group = node_id),
-                color = NA, alpha = 0.2) +
-    # Use a warm color palette to simulate the heatmap intensity
-    scale_fill_viridis_d(name = "Predicted seconds") +
-    
-    # --- B. HISTORICAL TRAJECTORY (Train) ---
-    geom_path(data = hist_data %>% group_by(player_id) %>% slice_tail(n = 5), 
-              aes(x = x, y = y, group = player_id),
-              color = "white", alpha = 0.7, linewidth = 0.5) +
-    # Emphasize the last known historical position
-    geom_point(data = hist_data %>% group_by(player_id) %>% slice_tail(n = 1), 
-               aes(x = x, y = y),
-               color = "white", size = 2, shape = 21, fill = "black") +
+    theme(
+      panel.background = element_rect(fill = "#1e222d", colour = NA),
+      plot.background = element_rect(fill = "#1e222d", colour = NA),
+      legend.background = element_rect(fill = "#1e222d", colour = NA),
+      legend.key = element_rect(fill = "#1e222d", colour = NA),
+      legend.text = element_text(color = "white", size = 9),
+      legend.title = element_text(color = "white", size = 10, face = "bold"),
+      plot.title = element_text(color = "white", size = 13, face = "bold", hjust = 0),
+      plot.subtitle = element_text(color = "#cccccc", size = 9, hjust = 0),
+      plot.margin = margin(12, 12, 12, 12)
+    ) +
+    # A. Regiões Conformes de Predição (Tubos de Incerteza)
+    geom_circle(
+      data = pred_data,
+      aes(x0 = pred_x, y0 = pred_y, r = conf_radius, fill = as.factor(time_step), group = node_id),
+      color = NA,
+      alpha = 0.18
+    ) +
+    scale_fill_viridis_d(name = "Horizonte (s)") +
 
-    # --- C. PREDICTED TRAJECTORY ---
-    geom_path(data = pred_data, 
-              aes(x = pred_x, y = pred_y, group = node_id),
-              color = "#00f5d4", linewidth = 1) +
-    geom_point(data = pred_data, 
-               aes(x = pred_x, y = pred_y, group = node_id),
-               color = "#00f5d4", size = 2) +
+    # B. Histórico Observado
+    geom_path(
+      data = hist_data %>% group_by(player_id) %>% slice_tail(n = 5), 
+      aes(x = x, y = y, group = player_id),
+      color = "white", alpha = 0.6, linewidth = 0.5, linetype = "dashed"
+    ) +
+    geom_point(
+      data = hist_data %>% group_by(player_id) %>% slice_tail(n = 1), 
+      aes(x = x, y = y),
+      color = "white", size = 1.8, shape = 21, fill = "black"
+    ) +
 
-    # --- D. TRUE TRAJECTORY (Test) ---
-    geom_path(data = pred_data, 
-              aes(x = true_x, y = true_y, group = node_id),
-              color = "#ffb703", linewidth = 1, linetype = "solid") +
-    geom_point(data = pred_data, 
-               aes(x = true_x, y = true_y, group = node_id),
-               color = "#ffb703", size = 2) +
+    # C. Trajetória Prevista pelo Modelo
+    geom_path(
+      data = pred_data, 
+      aes(x = pred_x, y = pred_y, group = node_id),
+      color = "#00f5d4", linewidth = 0.9
+    ) +
+    geom_point(
+      data = pred_data, 
+      aes(x = pred_x, y = pred_y, group = node_id),
+      color = "#00f5d4", size = 1.6
+    ) +
 
-    # Labels and aesthetics
-    labs(x = "", y = "") +
+    # D. Trajetória Real (Ground Truth)
+    geom_path(
+      data = pred_data, 
+      aes(x = true_x, y = true_y, group = node_id),
+      color = "#ffb703", linewidth = 0.9
+    ) +
+    geom_point(
+      data = pred_data, 
+      aes(x = true_x, y = true_y, group = node_id),
+      color = "#ffb703", size = 1.6
+    ) +
+
+    # Fixação de Proporção Cartesiana Real (1:1)
     coord_fixed(
       xlim = c(0, 105), 
       ylim = c(0, 68), 
       expand = FALSE 
     ) +
-    annotate(
-      "segment",
-      x = 5, xend = 25, y = 4, yend = 4,
-      arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
-      color = "white",
-      linewidth = 0.8,
-      alpha = 0.7
-    ) +
-    theme_minimal(base_family = "playfair", base_size = 12) +
-    theme(
-      plot.background  = element_rect(fill = "white", colour = NA),
-      panel.background = element_rect(fill = "#1A1A1A", colour = NA), 
-      panel.grid       = element_blank(),
-      panel.border     = element_rect(colour = "#DDDDDD", fill = NA, linewidth = 0.4),
-      axis.title       = element_blank(), 
-      axis.text        = element_blank(), 
-      axis.ticks       = element_blank(),
-      plot.margin      = margin(24, 28, 18, 28),
-      strip.background = element_rect(fill = "#F2F2F2", colour = "#DDDDDD", linewidth = 0.4),
-  
-      # Top facet labels (Quantiles / Mean)
-      strip.text.x = element_text(
-        colour = "#111111", 
-        size = 12, 
-        face = "bold",
-        margin = margin(t = 8, b = 8)
-      ),
-  
-      # Side facet labels (Attack / Defense)
-      strip.text.y = element_text(
-        colour = "#111111", 
-        size = 16,           # Increased size for the side text
-        face = "bold",
-        margin = margin(l = 8, r = 8) # Use left/right margin for vertical text padding
-      )
+    labs(
+      title = sprintf("Regiões Conformes Simultâneas (1 - \u03b1 = %.0f%%) | Lance %s", (1 - alpha) * 100, target_event_id),
+      subtitle = "Azul: Previsto | Amarelo: Real | Branco: Observado (t \u2264 25s) | Bandas: Regiões Conformes"
     )
-  
+
   return(p)
 }
-
 ```
 
+# EXECUÇÃO DO EXPERIMENTO & AVALIAÇÃO
 
-# FIT
-
-```{r}
-events <- read_csv(here('data', 'events_dfl.csv')) %>% 
+```{r load-raw-data}
+events <- read_csv(here('data', 'processed', 'events.csv'), show_col_types = FALSE) %>% 
   distinct() %>% 
-  rename(team_with_poss = team_id)
+  rename(team_with_poss = team_id) %>% 
+  mutate(event_id = as.integer(as.factor(event_id)))
 
-tracking <- read_csv(here('data', 'tracking_dfl_secs.csv')) %>%
-  distinct() %>% 
-  own_goal_direction() %>% 
-  filter(is_goalkeeper == 0)
+players_db <- read_csv(here('data', 'processed', 'players_database.csv'), show_col_types = FALSE) %>% 
+  select(player_id, team_name) %>% 
+  distinct()
 
-ball <- read_csv(here('data', 'tracking_dfl_secs.csv')) %>%
+tracking <- read_csv(here('data', 'processed', 'tracking.csv'), show_col_types = FALSE) %>%
   distinct() %>% 
-  own_goal_direction() %>% 
-  filter(player_id == 'ball') %>% 
-  select(period, time_sec_orig = time_seg, x_ball = x_pitch, y_ball = y_pitch, match_id)
+  left_join(players_db, by = "player_id")
 
 pitch_length <- 105
 pitch_width <- 68
 ```
 
-```{r}
+```{r prepare-windows}
 event_type = "SHOT"
 event_subtype = NA
 start_time = 30
 end_time = 1
 pred_time_event = 1
 
-events_prepared <- prepare_data(events, tracking, event_type, event_subtype, start_time, end_time, pred_time_event) %>% 
-  left_join(ball)
+events_prepared <- prepare_data(
+  events = events, 
+  tracking = tracking, 
+  event_type_filter = event_type, 
+  event_subtype = event_subtype, 
+  start_time = start_time, 
+  end_time = end_time, 
+  pred_time_event = pred_time_event
+)
 ```
 
-```{r}
-results <- run_training(events_prepared, max_epochs = 105, patience = 5)
+```{r train-model}
+results <- run_training(events_prepared, max_epochs = 100, patience = 8, lr = 0.001)
 
 model <- results$model
 test_dataset <- results$test_dataset
-val_loader <- results$val_loader # NEW: Extract validation loader
+calib_loader <- results$calib_loader
 scaler <- results$scaler
 ```
 
-```{r}
-# 1. Calibrate to get the 90% prediction regions (alpha = 0.1)
-# This uses the validation loader as the calibration set (D2)
+```{r calibrate-and-predict}
+# 1. Calibração Conforme no conjunto independente (sem duplo uso da validação)
+alpha_level <- 0.10
 conformal_calib <- calibrate_conformal(
   model = model, 
-  val_loader = val_loader, 
+  calib_loader = calib_loader, 
   scaler = scaler, 
-  alpha = 0.10 
+  alpha = alpha_level
 )
 
-# 2. Apply to the Test Set
+# 2. Inferência Conforme no Conjunto de Teste
 test_predictions <- predict_with_regions(
   model = model, 
-  test_dataset = test_dataset, 
+  dataset = test_dataset, 
   scaler = scaler, 
-  q_hats = conformal_calib$q_hats
+  r_t = conformal_calib$r_simultaneous
 )
 
 head(test_predictions)
 ```
 
-```{r}
-test_predictions$event_id %>% unique()
+```{r plot-prediction}
+test_events_available <- unique(test_predictions$event_id)
+cat("Lances disponíveis no Teste:", test_events_available, "\n")
 
-#117, 107, 92, 14
-sample_event_id <- 115
+sample_event_id <- test_events_available[1]
 
-plot_conformal_event(
+conf <- plot_conformal_event(
   target_event_id = sample_event_id, 
   events_prepared = events_prepared,
-  test_predictions = test_predictions %>% 
-    mutate(conf_radius = if_else(time_step %in% c(1, 2, 3, 4, 5), NA_integer_, conf_radius))
+  test_predictions = test_predictions,
+  alpha = alpha_level
 )
 
-# c(3, 4, 6, 8, 11, 13, 16, 17, 19, 20)
-ggsave(here("output" , "img", "lstm", "conf_2.pdf"), plot = conf, width = 10, height = 7, dpi = 300)
+conf
 ```
 
+```{r evaluation-metrics}
+# ==========================================
+# 6. TABELAS DE RESULTADOS & COBERTURA EMPÍRICA
+# ==========================================
 
-```{r}
-ids <- events_prepared %>% 
-  arrange(player_id, time_sec) %>% 
-  distinct(event_id, team_name, team_code, player_id) %>% 
-  group_by(event_id) %>% 
-  mutate(node_id = row_number()) %>% 
-  ungroup()
+# 1. Cobertura Empírica Simultânea da Trajetória (Alvo >= 90%)
+coverage_simultaneous <- test_predictions %>%
+  group_by(event_id, player_id) %>%
+  summarize(trajectory_covered = all(covered), .groups = "drop") %>%
+  summarize(
+    total_trajectories = n(),
+    empirical_coverage = mean(trajectory_covered)
+  )
 
-df_distances <- test_predictions %>%
-  mutate(
-    distance = sqrt((pred_x - true_x)^2 + (pred_y - true_y)^2)
-  ) %>% 
-  left_join(ids)
+cat(sprintf("\n=== COBERTURA EMPÍRICA SIMULTÂNEA DA TRAJETÓRIA (Alvo: >= %.1f%%) ===\n", (1 - alpha_level) * 100))
+print(coverage_simultaneous)
 
-ade_per_event <- df_distances %>%
+# 2. Cobertura Empírica Pontual por Segundo
+coverage_pointwise <- test_predictions %>%
+  group_by(time_step) %>%
+  summarize(
+    empirical_coverage = mean(covered),
+    mean_radius = mean(conf_radius),
+    .groups = "drop"
+  )
+
+cat("\n=== COBERTURA EMPÍRICA PONTUAL POR PASSO TEMPORAL ===\n")
+print(coverage_pointwise)
+
+# 3. Métricas de Deslocamento ADE e FDE por Time (Ataque vs Defesa)
+results_by_team <- test_predictions %>%
   group_by(team_code) %>%
-  summarize(ADE = mean(distance, na.rm = TRUE), .groups = "drop")
-
-fde_per_event <- df_distances %>%
-  group_by(team_code, node_id) %>%
-  filter(time_step == max(time_step)) %>%
-  group_by(team_code) %>%
-  summarize(FDE = mean(distance, na.rm = TRUE), .groups = "drop")
-
-results_table <- ade_per_event %>%
-  left_join(fde_per_event, by = "team_code") %>%
-  mutate(
-    ADE = round(ADE, 2),
-    FDE = round(FDE, 2)
+  summarize(
+    ADE = round(mean(distance, na.rm = TRUE), 2),
+    FDE = round(mean(distance[time_step == max(time_step)], na.rm = TRUE), 2),
+    .groups = "drop"
   )
 
-results_table
-```
+cat("\n=== MÉTRICAS DE ERRO DE PREDIÇÃO POR PAPEL TÁTICO ===\n")
+print(results_by_team)
 
-```{r}
-df_distances <- test_predictions %>%
-  mutate(
-    distance = sqrt((pred_x - true_x)^2 + (pred_y - true_y)^2)
-  )
-
-# 2. Calculate ADE per event_id
-ade_per_event <- df_distances %>%
+# 4. Métricas ADE e FDE por Lance (Jogada)
+results_by_event <- test_predictions %>%
   group_by(event_id) %>%
-  summarize(ADE = mean(distance, na.rm = TRUE), .groups = "drop")
-
-# 3. Calculate FDE per event_id
-fde_per_event <- df_distances %>%
-  # First, isolate the final time step for each node within each event
-  group_by(event_id, node_id) %>%
-  filter(time_step == max(time_step)) %>%
-  # Second, calculate the mean of those final distances per event
-  group_by(event_id) %>%
-  summarize(FDE = mean(distance, na.rm = TRUE), .groups = "drop")
-
-# 4. Combine into a final table
-results_table2 <- ade_per_event %>%
-  left_join(fde_per_event, by = "event_id") %>%
-  mutate(
-    ADE = round(ADE, 2),
-    FDE = round(FDE, 2)
+  summarize(
+    ADE = round(mean(distance, na.rm = TRUE), 2),
+    FDE = round(mean(distance[time_step == max(time_step)], na.rm = TRUE), 2),
+    Coverage = round(mean(covered), 3),
+    .groups = "drop"
   )
 
-results_table2
+head(results_by_event, 10)
 ```
-

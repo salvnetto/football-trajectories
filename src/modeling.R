@@ -74,7 +74,7 @@ prepare_data <- function(events, tracking, event_type_filter = "SHOT",
     
     # Identify the time of the event
     # Assumes a time_seconds column exists in events
-    evt_time <- evt$time_seconds 
+    evt_time <- round(evt$time_seconds)
     
     t_start <- evt_time - start_time
     t_end <- evt_time - end_time
@@ -86,6 +86,14 @@ prepare_data <- function(events, tracking, event_type_filter = "SHOT",
              time_sec_orig >= t_start, 
              time_sec_orig <= t_end)
     
+    if ("ball_x" %in% names(track_window) && !"x_ball" %in% names(track_window)) {
+      track_window <- track_window %>%
+        mutate(
+          x_ball = ball_x * pitch_length,
+          y_ball = ball_y * pitch_width
+        )
+    }
+    
     # Flip the entire tracking window if the attacking team was attacking left
     if (isTRUE(evt$flip_required)) {
       track_window <- track_window %>%
@@ -93,6 +101,13 @@ prepare_data <- function(events, tracking, event_type_filter = "SHOT",
           x_pitch = pitch_length - x_pitch,
           y_pitch = pitch_width - y_pitch
         )
+      if ("x_ball" %in% names(track_window)) {
+        track_window <- track_window %>%
+          mutate(
+            x_ball = pitch_length - x_ball,
+            y_ball = pitch_width - y_ball
+          )
+      }
     }
     
     # Create the relative time_sec index (e.g., 1 to 30)
@@ -117,8 +132,12 @@ prepare_data <- function(events, tracking, event_type_filter = "SHOT",
     # (Assuming long format tracking has x_pitch and y_pitch)
     if (nrow(track_window) > 0) {
       track_window <- track_window %>%
-        select(x = x_pitch, y = y_pitch, time_sec, match_id, player_id, any_of(c("team_code", "team_id"))) %>%
-        mutate(anchor_event_id = evt$event_id)
+        select(x = x_pitch, y = y_pitch, time_sec, match_id, player_id, any_of(c("team_code", "team_id", "team_name", "x_ball", "y_ball", "ball_speed", period_col_track, "time_sec_orig"))) %>%
+        mutate(
+          anchor_event_id = evt$event_id,
+          event_id = evt$event_id,
+          team_with_poss = if ("team_with_poss" %in% names(evt)) evt$team_with_poss else NA_character_
+        )
       
       dataset_list[[i]] <- track_window
     }
