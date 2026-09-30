@@ -1,57 +1,36 @@
 # ==========================================================================
-# Seções:
-#   0. Setup & reprodutibilidade
-#   1. Pré-processamento & construção do dataset
-#   2. Definição do modelo (TrajectorySeq2SeqGNNv2)
-#   3. Treino & avaliação experimental
-#   4. HOTSPOT — Predição conforme: calibração & inferência
 #   5. Execução: carregamento dos dados & janelas
-#   6. Experimentos: escada E0–E3
-#   7. Calibração conforme & predições no teste (modelo final)
-#   8. Plots
+#   6. Experimento E3_mirror
+#   7. Calibração conforme & predições no teste
+#   8. Plot da jogada de teste
 #   9. Avaliação & tabelas de resultados
 # ==========================================================================
 
 
 # ==========================================================================
-# 0. SETUP & REPRODUTIBILIDADE
+# 0. SETUP
 # ==========================================================================
 library(torch)
 library(tidyverse)
 library(ggsoccer)
 library(R6)
 library(here)
-library(readr)
 library(ggforce)
 
-source(here("src", "modeling.R"))
-
-set_seed <- function(seed = 42) {
-  set.seed(seed)
-  torch_manual_seed(seed)
-}
-
-get_device <- function() {
-  if (cuda_is_available()) {
-    return(torch_device("cuda"))
-  } else if (backends_mps_is_available()) {
-    return(torch_device("mps"))
-  } else {
-    return(torch_device("cpu"))
-  }
-}
+source(here("src", "modeling.R"))   # prepare_data()
 
 
 # ==========================================================================
 # 1. PRÉ-PROCESSAMENTO & CONSTRUÇÃO DO DATASET
-#    (janelas de 30 s centradas em finalizações de jogo aberto no meio-campo ofensivo,
-#    orientação normalizada ataque -> direita, 25 frames observados + 5 alvo)
 # ==========================================================================
 
+# Colação customizada para lotes de tamanho 1 (preserva tipos e metadados R)
 custom_collate <- function(batch) {
   batch[[1]]
 }
 
+# Espelhamento lateral exato y -> 68 - y no espaço z-scoreado:
+# y'_s = (68 - 2*mu_y)/sd_y - y_s  (a média/desvio do scaler NÃO se alteram)
 mirror_graph <- function(g, scaler) {
   a_y     <- (68 - 2 * scaler$center["y"])     / scaler$scale["y"]
   a_yball <- (68 - 2 * scaler$center["y_ball"]) / scaler$scale["y_ball"]
@@ -67,20 +46,14 @@ mirror_graph <- function(g, scaler) {
   g2
 }
 
-preprocess_and_build_dataset <- function(df, 
-                                         train_prop = 0.60, 
-                                         val_prop = 0.15, 
-                                         calib_prop = 0.15, 
-                                         seed = 42,
-                                         augment_mirror = FALSE) {
-  set.seed(seed)
+preprocess_and_build_dataset <- function(df) {
+  set.seed(42)
   df <- as.data.frame(df)
 
-  # 1. Codificação Categórica Robusta
-  # team_code ("Attack" / "Defense") indica o papel tático na posse
+  # 1. Codificação categórica (1 = Defense, 2 = Attack)
   df <- df |>
     mutate(
-      role_idx = if_else(team_code == "Attack", 2L, 1L), # 1 = Defense, 2 = Attack
+      role_idx = if_else(team_code == "Attack", 2L, 1L),
       team_id_idx = as.integer(as.factor(team_id))
     ) |> 
     group_by(player_id, event_id) |>
@@ -92,26 +65,24 @@ preprocess_and_build_dataset <- function(df,
     ) |>
     ungroup()
 
-  encoders <- list(
-    num_teams = max(df$team_id_idx, na.rm = TRUE),
-    num_roles = 2L
-  )
+  num_teams <- max(df$team_id_idx, na.rm = TRUE)
 
-  # 2. Particionamento por Jogada Independente
+  # 2. Particionamento por jogada independente (sem vazamento entre frames
+  #    da mesma jogada): 60% treino, 15% validação, 15% calibração, 10% teste
   unique_events <- unique(df$event_id)
   n_events <- length(unique_events)
   shuffled_events <- sample(unique_events)
 
-  n_train <- floor(train_prop * n_events)
-  n_val <- floor(val_prop * n_events)
-  n_calib <- floor(calib_prop * n_events)
+  n_train <- floor(0.60 * n_events)
+  n_val <- floor(0.15 * n_events)
+  n_calib <- floor(0.15 * n_events)
 
   train_events <- shuffled_events[1:n_train]
   val_events <- shuffled_events[(n_train + 1):(n_train + n_val)]
   calib_events <- shuffled_events[(n_train + n_val + 1):(n_train + n_val + n_calib)]
   test_events <- shuffled_events[(n_train + n_val + n_calib + 1):n_events]
 
-  # 3. Escalonamento (Ajustado APENAS no Treino, t <= 25)
+  # 3. Escalonamento z-score ajustado APENAS no treino (t <= 25)
   cont_cols <- c('x', 'y', 'ball_speed', 'x_ball', 'y_ball', 'dist_to_ball', 'vel_x', 'vel_y')
   train_obs <- df |> filter(event_id %in% train_events, time_sec <= 25)
 
@@ -119,10 +90,9 @@ preprocess_and_build_dataset <- function(df,
   scaler_scale <- apply(train_obs[, cont_cols], 2, sd, na.rm = TRUE)
   scaler_scale[scaler_scale == 0] <- 1
 
-  # Padronização z-score das variáveis contínuas
   df[, cont_cols] <- scale(df[, cont_cols], center = scaler_center, scale = scaler_scale)
 
-  # 4. Construção dos Grafos por Jogada
+  # 4. Construção dos grafos por jogada
   event_list <- df |> group_split(event_id)
   graphs <- list()
 
@@ -135,7 +105,7 @@ preprocess_and_build_dataset <- function(df,
     obs_counts <- table(obs_df$player_id)
     target_counts <- table(target_df$player_id)
 
-    # Identificar jogadores presentes em todos os 25 frames observados e 5 alvos
+    # Jogadores presentes em todos os 25 frames observados e 5 alvos
     valid_players <- names(obs_counts)[obs_counts == 25]
     valid_players <- valid_players[valid_players %in% names(target_counts)]
     valid_players <- valid_players[target_counts[valid_players] == 5]
@@ -186,19 +156,12 @@ preprocess_and_build_dataset <- function(df,
   calib_indices <- which(graph_event_ids %in% calib_events)
   test_indices <- which(graph_event_ids %in% test_events)
 
-  # 5. Aumento por espelhamento lateral (apenas no treino, se solicitado)
-  if (augment_mirror) {
-    scaler_ls <- list(center = scaler_center, scale = scaler_scale)
-    mirrored <- lapply(graphs[train_indices], mirror_graph, scaler = scaler_ls)
-    for (i in seq_along(mirrored)) {
-      mirrored[[i]]$event_id <- paste0(mirrored[[i]]$event_id, "_mirror")
-      mirrored[[i]]$is_mirror <- TRUE
-    }
-    for (i in seq_along(graphs)) graphs[[i]]$is_mirror <- FALSE
-    n_orig <- length(graphs)
-    graphs <- c(graphs, mirrored)
-    train_indices <- c(train_indices, (n_orig + 1):(n_orig + length(mirrored)))
-  }
+  # 5. Aumento por espelhamento lateral (sempre ativo em E3)
+  scaler_ls <- list(center = scaler_center, scale = scaler_scale)
+  mirrored <- lapply(graphs[train_indices], mirror_graph, scaler = scaler_ls)
+  n_orig <- length(graphs)
+  graphs <- c(graphs, mirrored)
+  train_indices <- c(train_indices, (n_orig + 1):(n_orig + length(mirrored)))
 
   list(
     graphs = graphs,
@@ -208,7 +171,7 @@ preprocess_and_build_dataset <- function(df,
       calib = calib_indices,
       test = test_indices
     ),
-    encoders = encoders,
+    num_teams = num_teams,
     scaler = list(center = scaler_center, scale = scaler_scale)
   )
 }
@@ -227,16 +190,16 @@ TrajectoryDataset <- dataset(
 TrajectorySeq2SeqGNNv2 <- nn_module(
   "TrajectorySeq2SeqGNNv2",
 
-  initialize = function(num_teams, num_roles = 2, cont_dim = 8, hidden_dim = 64,
-                        dropout_rate = 0.2, scaler = NULL,
-                        use_social_decoder = TRUE, use_cv_prior = TRUE) {
+  initialize = function(num_teams, scaler) {
+    cont_dim <- 8
+    hidden_dim <- 64
+    dropout_rate <- 0.2
 
     # ---- Encoder espaçotemporal ----
     self$team_emb <- nn_embedding(num_embeddings = num_teams + 2, embedding_dim = 4)
-    self$role_emb <- nn_embedding(num_embeddings = num_roles + 2, embedding_dim = 4)
+    self$role_emb <- nn_embedding(num_embeddings = 4, embedding_dim = 4) # num_roles + 2
 
-    input_dim <- cont_dim + 4 + 4
-    self$feat_proj <- nn_linear(input_dim, hidden_dim)
+    self$feat_proj <- nn_linear(cont_dim + 4 + 4, hidden_dim)
 
     self$spatial_attention <- nn_multihead_attention(embed_dim = hidden_dim, num_heads = 4, batch_first = TRUE)
     self$norm1 <- nn_layer_norm(hidden_dim)
@@ -244,35 +207,26 @@ TrajectorySeq2SeqGNNv2 <- nn_module(
 
     self$temporal_encoder <- nn_lstm(input_size = hidden_dim, hidden_size = hidden_dim, batch_first = TRUE)
 
-    # ---- Decodificador com interação social dinâmica ----
+    # ---- Decodificador com interação social dinâmica (Social-BiGAT / STGAT) ----
     self$dec_input_proj <- nn_linear(2 + 2 + hidden_dim, hidden_dim)
     self$temporal_decoder <- nn_lstm(input_size = hidden_dim, hidden_size = hidden_dim, batch_first = TRUE)
 
-    # Atenção de grafo recomputada a cada passo futuro (Social-BiGAT / STGAT)
+    # Atenção de grafo recomputada a cada passo futuro
     self$social_attention <- nn_multihead_attention(embed_dim = hidden_dim, num_heads = 4, batch_first = TRUE)
     self$norm_social <- nn_layer_norm(hidden_dim)
     self$dropout_social <- nn_dropout(dropout_rate)
 
-    # Cabeça de saída: prevê o resíduo em relação ao prior cinemático (C1)
+    # Cabeça de saída: prevê o resíduo em relação ao prior cinemático
     self$out <- nn_sequential(
       nn_linear(hidden_dim, hidden_dim),
       nn_gelu(),
       nn_linear(hidden_dim, 2)
     )
 
-    self$use_social_decoder <- use_social_decoder
-    self$use_cv_prior <- use_cv_prior
-
     # Buffers para harmonização cinemática entre deslocamento e escala de velocidade
-    if (!is.null(scaler)) {
-      self$sd_pos <- nn_buffer(torch_tensor(scaler$scale[c("x", "y")])$view(c(1, 2)))
-      self$sd_vel <- nn_buffer(torch_tensor(scaler$scale[c("vel_x", "vel_y")])$view(c(1, 2)))
-      self$mu_vel <- nn_buffer(torch_tensor(scaler$center[c("vel_x", "vel_y")])$view(c(1, 2)))
-    } else {
-      self$sd_pos <- nn_buffer(torch_ones(1, 2))
-      self$sd_vel <- nn_buffer(torch_ones(1, 2))
-      self$mu_vel <- nn_buffer(torch_zeros(1, 2))
-    }
+    self$sd_pos <- nn_buffer(torch_tensor(scaler$scale[c("x", "y")])$view(c(1, 2)))
+    self$sd_vel <- nn_buffer(torch_tensor(scaler$scale[c("vel_x", "vel_y")])$view(c(1, 2)))
+    self$mu_vel <- nn_buffer(torch_tensor(scaler$center[c("vel_x", "vel_y")])$view(c(1, 2)))
   },
 
   forward = function(batch) {
@@ -329,24 +283,18 @@ TrajectorySeq2SeqGNNv2 <- nn_module(
 
       z_t <- dec_hidden$squeeze(2) # [num_nodes, hidden_dim]
 
-      # troca de mensagens entre jogadores no passo t
-      if (self$use_social_decoder) {
-        social_in <- z_t$unsqueeze(1) # [1, num_nodes, hidden_dim]
-        attn_out <- self$social_attention(social_in, social_in, social_in)[[1]]
-        z_t <- self$norm_social(z_t + attn_out$squeeze(1))
-        z_t <- self$dropout_social(z_t)
-      }
+      # Troca de mensagens entre jogadores no passo t
+      social_in <- z_t$unsqueeze(1) # [1, num_nodes, hidden_dim]
+      attn_out <- self$social_attention(social_in, social_in, social_in)[[1]]
+      z_t <- self$norm_social(z_t + attn_out$squeeze(1))
+      z_t <- self$dropout_social(z_t)
 
       pred_disp <- self$out(z_t) # [num_nodes, 2] — resíduo em relação ao prior
 
-      # C1: prior cinemático de velocidade constante
-      if (self$use_cv_prior) {
-        v_pos <- (current_vel * self$sd_vel + self$mu_vel) / self$sd_pos
-        prior_disp <- t * v_pos
-        disp_total <- prior_disp + pred_disp
-      } else {
-        disp_total <- pred_disp
-      }
+      # Prior cinemático de velocidade constante
+      v_pos <- (current_vel * self$sd_vel + self$mu_vel) / self$sd_pos
+      prior_disp <- t * v_pos
+      disp_total <- prior_disp + pred_disp
 
       # Atualização da posição no espaço escalonado
       current_pos <- current_pos + disp_total
@@ -364,7 +312,7 @@ TrajectorySeq2SeqGNNv2 <- nn_module(
 
 
 # ==========================================================================
-# 3. TREINO & AVALIAÇÃO EXPERIMENTAL
+# 3. TREINO
 # ==========================================================================
 compute_ade_loss_and_fde <- function(preds, targets, scaler) {
   mu <- c(scaler$center["x"], scaler$center["y"])
@@ -413,15 +361,22 @@ EarlyStopping <- R6Class("EarlyStopping",
   )
 )
 
-run_experiment <- function(df_raw, model_args = list(), augment_mirror = FALSE,
-                           max_epochs = 100, patience = 10, lr = 0.001, seed = 42) {
-  set_seed(seed)
-  device <- get_device()
+run_experiment <- function(df_raw) {
+  # Reproduzibilidade estrita (seed 42)
+  set.seed(42)
+  torch_manual_seed(42)
 
-  prep_data <- preprocess_and_build_dataset(df_raw, seed = seed, augment_mirror = augment_mirror)
+  device <- if (cuda_is_available()) {
+    torch_device("cuda")
+  } else if (backends_mps_is_available()) {
+    torch_device("mps")
+  } else {
+    torch_device("cpu")
+  }
+
+  prep_data <- preprocess_and_build_dataset(df_raw)
   graphs <- prep_data$graphs
   splits <- prep_data$splits
-  encoders <- prep_data$encoders
   scaler <- prep_data$scaler
 
   train_dataset <- TrajectoryDataset(graphs[splits$train])
@@ -432,18 +387,18 @@ run_experiment <- function(df_raw, model_args = list(), augment_mirror = FALSE,
   train_loader <- dataloader(train_dataset, batch_size = 1, shuffle = TRUE, collate_fn = custom_collate)
   val_loader <- dataloader(val_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
   calib_loader <- dataloader(calib_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
-  test_loader <- dataloader(test_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
 
-  model <- do.call(TrajectorySeq2SeqGNNv2$new, c(list(
-    num_teams = encoders$num_teams,
-    num_roles = encoders$num_roles,
-    cont_dim = 8,
-    hidden_dim = 64,
-    dropout_rate = 0.2,
+  model <- TrajectorySeq2SeqGNNv2$new(
+    num_teams = prep_data$num_teams,
     scaler = scaler
-  ), model_args))$to(device = device)
+  )$to(device = device)
 
   n_params <- sum(sapply(model$parameters, function(p) p$numel()))
+
+  # Configuração de treino do E3_mirror (inalterada em relação ao notebook)
+  lr <- 0.001
+  max_epochs <- 100
+  patience <- 10
 
   optimizer <- optim_adam(model$parameters, lr = lr, weight_decay = 1e-5)
   scheduler <- lr_reduce_on_plateau(optimizer, mode = "min", factor = 0.5, patience = 2)
@@ -535,13 +490,9 @@ run_experiment <- function(df_raw, model_args = list(), augment_mirror = FALSE,
     model = model,
     test_dataset = test_dataset,
     calib_loader = calib_loader,
-    val_loader = val_loader,
     scaler = scaler,
-    encoders = encoders,
-    splits = splits,
     history = history,
     n_params = n_params,
-    best_epoch = history$epoch[which.min(history$val_fde)],
     val_ade_best = min(history$val_ade),
     val_fde_best = min(history$val_fde)
   )
@@ -565,21 +516,9 @@ band_shape <- function(err_matrix) {
   s_hat
 }
 
-# Escore por trajetória de jogador (Alvo B): R_i = max_{t in 1:5} (e_{i,t} / s_hat_t)
+# Escore por trajetória de jogador: R_i = max_{t in 1:5} (e_{i,t} / s_hat_t)
 score_supremum_trajectory <- function(err_matrix, s_hat) {
   apply(err_matrix, 1, function(row) max(row / s_hat))
-}
-
-# Escore por jogada completa (Alvo A): supremo sobre jogadores e horizontes
-score_event_supremum <- function(all_player_errors, s_hat) {
-  sapply(all_player_errors, function(mat) {
-    max(apply(mat, 1, function(row) max(row / s_hat)))
-  })
-}
-
-# Escore marginal pontual: erro bruto e_{i,t} em cada horizonte [n_traj, 5]
-score_pointwise <- function(err_matrix) {
-  err_matrix
 }
 
 # Coleta dos erros de calibração (laço estável: não muda ao trocar escores)
@@ -619,7 +558,7 @@ compute_calibration_errors <- function(model, calib_loader, scaler) {
   )
 }
 
-# API estável de calibração
+# Calibração: devolve s_hat, quantil e raios simultâneos r_t
 calibrate_conformal <- function(model, calib_loader, scaler, alpha = 0.10) {
   errs <- compute_calibration_errors(model, calib_loader, scaler)
   err_matrix <- errs$err_matrix
@@ -631,40 +570,23 @@ calibrate_conformal <- function(model, calib_loader, scaler, alpha = 0.10) {
   # Passo 1: Forma temporal típica do erro s_hat
   s_hat <- band_shape(err_matrix)
 
-  # Passo 2: Escores de não-conformidade (uma função por escore)
+  # Passo 2: Escore de não-conformidade por trajetória
   R_player <- score_supremum_trajectory(err_matrix, s_hat)
-  R_event <- score_event_supremum(all_player_errors, s_hat)
-  S_pointwise <- score_pointwise(err_matrix)
 
-  # Passo 3: Quantis conformes com correção exata de amostra finita
+  # Passo 3: Quantil conforme com correção exata de amostra finita
   q_hat_player <- quantile(R_player, probs = finite_sample_quantile_level(n_players, alpha), names = FALSE)
   r_simultaneous <- q_hat_player * s_hat
-
-  q_hat_event <- quantile(R_event, probs = finite_sample_quantile_level(n_events, alpha), names = FALSE)
-  r_event <- q_hat_event * s_hat
-
-  # Quantis pontuais marginais (apenas para contraste metodológico)
-  q_level_pw <- finite_sample_quantile_level(n_players, alpha)
-  q_pointwise <- numeric(5)
-  for (t in 1:5) {
-    q_pointwise[t] <- quantile(S_pointwise[, t], probs = q_level_pw, names = FALSE)
-  }
 
   cat(sprintf("\n=== CALIBRAÇÃO CONFORME RIGOROSA (alpha = %.2f) ===\n", alpha))
   cat(sprintf("Amostra de Calibração: %d jogadas independentes (%d trajetórias)\n", n_events, n_players))
   cat("Forma da banda s_hat (medianas em metros):", round(s_hat, 2), "\n")
-  cat(sprintf("Quantil Conforme Simultâneo (Alvo B): %.3f\n", q_hat_player))
-  cat("Raios Conformes Simultâneos (r_t em metros):", round(r_simultaneous, 2), "\n")
-  cat(sprintf("Quantil por Jogada Completa (Alvo A): %.3f\n", q_hat_event))
-  cat("Raios Marginais Pontuais (q_pw em metros):", round(q_pointwise, 2), "\n\n")
+  cat(sprintf("Quantil Conforme Simultâneo: %.3f\n", q_hat_player))
+  cat("Raios Conformes Simultâneos (r_t em metros):", round(r_simultaneous, 2), "\n\n")
 
   list(
     s_hat = s_hat,
     q_hat_player = q_hat_player,
     r_simultaneous = r_simultaneous,
-    q_hat_event = q_hat_event,
-    r_event = r_event,
-    r_pointwise = q_pointwise,
     alpha = alpha
   )
 }
@@ -742,7 +664,7 @@ predict_with_regions <- function(model, dataset, scaler, r_t) {
 
 
 # ==========================================================================
-# 5. EXECUÇÃO: CARREGAMENTO DOS DADOS & JANELAS
+# 5. EXECUÇÃO
 # ==========================================================================
 events <- read_csv(here('data', 'processed', 'events.csv'), show_col_types = FALSE) |> 
   distinct() |> 
@@ -757,96 +679,31 @@ tracking <- read_csv(here('data', 'processed', 'tracking.csv'), show_col_types =
   distinct() |> 
   left_join(players_db, by = "player_id")
 
-pitch_length <- 105
-pitch_width <- 68
-
-event_type = "SHOT"
-event_subtype = NA
-start_time = 30
-end_time = 1
-pred_time_event = 1
-
+# Janelas de 30 s centradas na finalização (25 observados + 5 alvo)
 events_prepared <- prepare_data(
   events = events, 
   tracking = tracking, 
-  event_type_filter = event_type, 
-  event_subtype = event_subtype, 
-  start_time = start_time, 
-  end_time = end_time, 
-  pred_time_event = pred_time_event
+  event_type_filter = "SHOT", 
+  event_subtype = NA, 
+  start_time = 30, 
+  end_time = 1, 
+  pred_time_event = 1
 )
+
+
+res <- run_experiment(events_prepared)
+
+model <- res$model
+test_dataset <- res$test_dataset
+calib_loader <- res$calib_loader
+scaler <- res$scaler
+
+cat(sprintf("\nValidação: ADE %.2f m | FDE %.2f m | %d parâmetros\n",
+            res$val_ade_best, res$val_fde_best, res$n_params))
 
 
 # ==========================================================================
-# 6. EXPERIMENTOS: ESCADA E0–E3
-#
-# Todas as execuções compartilham seed 42, partições por jogada, scaler e
-# conjunto de teste; só mudam as opções do modelo/treino:
-#   E0 | Baseline (números documentados)                     | referência
-#   E1 | Baseline + prior cinemático CV (C1)                 | efeito do prior residual
-#   E2 | E1 + decodificador social dinâmico                  | efeito da mudança principal
-#   E3 | E2 + espelhamento lateral (C2)                      | efeito do aumento
-# Modelo final = menor FDE de validação entre E1–E3; teste usado apenas
-# para o baseline e para o modelo final.
-# ==========================================================================
-
-# ---- E0: números documentados da execução do baseline (mesmas partições, seed 42) ----
-e0 <- data.frame(
-  experiment = "E0 — Baseline (Seq2Seq + GNN)",
-  val_ade = 4.34, val_fde = 6.90,
-  test_ade = 3.96, test_fde = 6.52,
-  cov_sim = 0.928, radius_t5 = 17.1,
-  n_params = 93186,
-  stringsAsFactors = FALSE
-)
-
-# ---- E1 a E3 ----
-exp_tags <- c("E1_prior", "E2_social", "E3_mirror")
-exp_cfg <- list(
-  E1_prior  = list(model_args = list(use_social_decoder = FALSE, use_cv_prior = TRUE), augment_mirror = FALSE),
-  E2_social = list(model_args = list(use_social_decoder = TRUE,  use_cv_prior = TRUE), augment_mirror = FALSE),
-  E3_mirror = list(model_args = list(use_social_decoder = TRUE,  use_cv_prior = TRUE), augment_mirror = TRUE)
-)
-
-exp_results <- list()
-for (tag in exp_tags) {
-  cat(sprintf("\n========== %s ==========\n", tag))
-  cfg <- exp_cfg[[tag]]
-  exp_results[[tag]] <- run_experiment(
-    events_prepared,
-    model_args = cfg$model_args,
-    augment_mirror = cfg$augment_mirror,
-    max_epochs = 100, patience = 10, lr = 0.001, seed = 42
-  )
-}
-
-# Curvas de validação
-history_df <- bind_rows(
-  lapply(exp_tags, function(tag) exp_results[[tag]]$history |> mutate(experiment = tag))
-)
-
-ggplot(history_df, aes(x = epoch, y = val_fde, color = experiment)) +
-  geom_line() +
-  labs(x = "Época", y = "FDE de validação (m)", color = "Experimento",
-       title = "Convergência dos experimentos (FDE de validação)")
-
-# Seleção do modelo final pela validação
-val_table <- sapply(exp_results, function(r) c(val_ade = r$val_ade_best, val_fde = r$val_fde_best, n_params = r$n_params))
-print(t(val_table))
-
-final_tag <- names(exp_results)[which.min(sapply(exp_results, function(r) r$val_fde_best))]
-cat("\nModelo final selecionado (menor FDE de validação):", final_tag, "\n")
-
-final_results <- exp_results[[final_tag]]
-model <- final_results$model
-test_dataset <- final_results$test_dataset
-calib_loader <- final_results$calib_loader
-scaler <- final_results$scaler
-
-
-# ==========================================================================
-# 7. CALIBRAÇÃO CONFORME & PREDIÇÕES NO TESTE (MODELO FINAL)
-#    (chunk: calibrate-and-predict-final)
+# 6. CALIBRAÇÃO CONFORME & PREDIÇÕES NO TESTE
 # ==========================================================================
 # 1. Calibração Conforme no conjunto independente (metodologia inalterada)
 alpha_level <- 0.10
@@ -868,11 +725,7 @@ test_predictions <- predict_with_regions(
 head(test_predictions)
 
 
-# ==========================================================================
-# 8. PLOTS
-# ==========================================================================
-
-# ---- Regiões conformes de uma jogada no campo (chunk visualization) ----
+# Regiões conformes simultâneas de uma jogada no campo
 plot_conformal_event <- function(target_event_id, events_prepared, test_predictions, alpha = 0.10) {
   pred_data <- test_predictions |>
     filter(event_id == target_event_id)
@@ -960,11 +813,11 @@ plot_conformal_event <- function(target_event_id, events_prepared, test_predicti
   return(p)
 }
 
-# ---- Jogada de teste do modelo final (chunk plot-prediction-final) ----
+# Jogada de teste do modelo final
 test_events_available <- unique(test_predictions$event_id)
 cat("Lances disponíveis no Teste:", test_events_available, "\n")
 
-sample_event_id <- test_events_available[1]
+sample_event_id <- test_events_available[6]
 
 conf <- plot_conformal_event(
   target_event_id = sample_event_id, 
@@ -975,191 +828,13 @@ conf <- plot_conformal_event(
 
 conf
 
-# ---- Reprodução exata do baseline E0 para a comparação visual ----
-# (mesma seed, mesmas partições e mesmo protocolo de treino; com as duas
-#  opções desativadas, TrajectorySeq2SeqGNNv2 é matematicamente idêntica à
-#  arquitetura anterior — equivalência verificada por teste exato de saída)
-exp_E0 <- run_experiment(
-  events_prepared,
-  model_args = list(use_social_decoder = FALSE, use_cv_prior = FALSE),
-  augment_mirror = FALSE,
-  max_epochs = 100, patience = 8, lr = 0.001, seed = 42
-)
-calib_E0 <- calibrate_conformal(exp_E0$model, exp_E0$calib_loader, exp_E0$scaler, alpha = alpha_level)
-preds_E0 <- predict_with_regions(
-  model = exp_E0$model,
-  dataset = exp_E0$test_dataset,
-  scaler = exp_E0$scaler,
-  r_t = calib_E0$r_simultaneous
-)
 
-# ---- Plot comparativo: mesma jogada de teste nas duas arquiteturas ----
-plot_comparison_event <- function(target_event_id, events_prepared, preds_old, preds_new, alpha = 0.10) {
-  evt <- target_event_id
-  evt_old <- preds_old |> filter(event_id == evt)
-  evt_new <- preds_new |> filter(event_id == evt)
-
-  ade_old <- mean(evt_old$distance, na.rm = TRUE)
-  fde_old <- mean(evt_old$distance[evt_old$time_step == max(evt_old$time_step)], na.rm = TRUE)
-  ade_new <- mean(evt_new$distance, na.rm = TRUE)
-  fde_new <- mean(evt_new$distance[evt_new$time_step == max(evt_new$time_step)], na.rm = TRUE)
-
-  pred_data <- bind_rows(
-    evt_old |> mutate(modelo = sprintf("Baseline — Seq2Seq + GNN  (ADE %.1f m | FDE %.1f m)", ade_old, fde_old)),
-    evt_new |> mutate(modelo = sprintf("Final — Decoder Social Dinâmico  (ADE %.1f m | FDE %.1f m)", ade_new, fde_new))
-  )
-  pred_data$modelo <- factor(pred_data$modelo, levels = unique(pred_data$modelo))
-
-  valid_pids <- unique(pred_data$player_id)
-  hist_data <- events_prepared |>
-    filter(event_id == evt, time_sec <= 25, player_id %in% valid_pids) |>
-    arrange(player_id, time_sec)
-  # Histórico replicado nos dois painéis
-  hist_data <- bind_rows(
-    hist_data |> mutate(modelo = levels(pred_data$modelo)[1]),
-    hist_data |> mutate(modelo = levels(pred_data$modelo)[2])
-  ) |> mutate(modelo = factor(modelo, levels = levels(pred_data$modelo)))
-
-  ggplot() +
-    annotate_pitch(dimensions = pitch_international, fill = NA, colour = "white", limits = FALSE) +
-    theme_pitch() +
-    theme(
-      panel.background = element_rect(fill = "#1e222d", colour = NA),
-      plot.background = element_rect(fill = "#1e222d", colour = NA),
-      legend.background = element_rect(fill = "#1e222d", colour = NA),
-      legend.key = element_rect(fill = "#1e222d", colour = NA),
-      legend.text = element_text(color = "white", size = 9),
-      legend.title = element_text(color = "white", size = 10, face = "bold"),
-      plot.title = element_text(color = "white", size = 13, face = "bold", hjust = 0),
-      plot.subtitle = element_text(color = "#cccccc", size = 9, hjust = 0),
-      strip.background = element_rect(fill = "#242838", colour = NA),
-      strip.text = element_text(color = "white", size = 10, face = "bold"),
-      panel.spacing = unit(1.2, "lines"),
-      plot.margin = margin(12, 12, 12, 12)
-    ) +
-    geom_circle(
-      data = pred_data,
-      aes(x0 = pred_x, y0 = pred_y, r = conf_radius, fill = as.factor(time_step), group = node_id),
-      color = NA, alpha = 0.18
-    ) +
-    scale_fill_manual(name = "Horizonte (s)", values = viridisLite::viridis(5)) +
-    geom_path(
-      data = hist_data |> group_by(modelo, player_id) |> slice_tail(n = 5),
-      aes(x = x, y = y, group = interaction(modelo, player_id)),
-      color = "white", alpha = 0.6, linewidth = 0.5, linetype = "dashed"
-    ) +
-    geom_point(
-      data = hist_data |> group_by(modelo, player_id) |> slice_tail(n = 1),
-      aes(x = x, y = y),
-      color = "white", size = 1.8, shape = 21, fill = "black"
-    ) +
-    geom_path(data = pred_data, aes(x = pred_x, y = pred_y, group = node_id), color = "#00f5d4", linewidth = 0.9) +
-    geom_point(data = pred_data, aes(x = pred_x, y = pred_y, group = node_id), color = "#00f5d4", size = 1.6) +
-    geom_path(data = pred_data, aes(x = true_x, y = true_y, group = node_id), color = "#ffb703", linewidth = 0.9) +
-    geom_point(data = pred_data, aes(x = true_x, y = true_y, group = node_id), color = "#ffb703", size = 1.6) +
-    facet_wrap(~modelo, ncol = 2) +
-    coord_fixed(xlim = c(0, 105), ylim = c(0, 68), expand = FALSE) +
-    labs(
-      title = sprintf("Mesma jogada de teste (%s): arquitetura anterior vs final", evt),
-      subtitle = "Branco: observado (t \u2264 25 s) | Azul: previsto | Amarelo: real | Bandas: regi\u00f5es conformes simult\u00e2neas (1 - \u03b1 = 90%)"
-    )
-}
-
-# ---- Invocação da comparação (chunk plot-comparison) ----
-conf_comparison <- plot_comparison_event(
-  target_event_id = sample_event_id,
-  events_prepared = events_prepared,
-  preds_old = preds_E0,
-  preds_new = test_predictions,
-  alpha = alpha_level
-)
-
-conf_comparison
-
-
-# ==========================================================================
-# 9. AVALIAÇÃO & TABELAS DE RESULTADOS (MODELO FINAL)
-#    (chunk: evaluation-metrics-final)
-# ==========================================================================
-
-# 0. Erro global no teste
 final_overall <- test_predictions |>
   summarize(
     ADE = mean(distance, na.rm = TRUE),
     FDE = mean(distance[time_step == max(time_step)], na.rm = TRUE),
     .groups = "drop"
   )
-cat(sprintf("MODELO FINAL (%s) — Teste: ADE = %.2f m | FDE = %.2f m\n", final_tag, final_overall$ADE, final_overall$FDE))
-
-# 1. Cobertura Empírica Simultânea da Trajetória (Alvo >= 90%)
-coverage_simultaneous <- test_predictions |>
-  group_by(event_id, player_id) |>
-  summarize(trajectory_covered = all(covered), .groups = "drop") |>
-  summarize(
-    total_trajectories = n(),
-    empirical_coverage = mean(trajectory_covered)
-  )
-
-cat(sprintf("\n=== COBERTURA EMPÍRICA SIMULTÂNEA DA TRAJETÓRIA (Alvo: >= %.1f%%) ===\n", (1 - alpha_level) * 100))
-print(coverage_simultaneous)
-
-# 2. Cobertura Empírica Pontual por Segundo
-coverage_pointwise <- test_predictions |>
-  group_by(time_step) |>
-  summarize(
-    empirical_coverage = mean(covered),
-    mean_radius = mean(conf_radius),
-    .groups = "drop"
-  )
-
-cat("\n=== COBERTURA EMPÍRICA PONTUAL POR PASSO TEMPORAL ===\n")
-print(coverage_pointwise)
-
-# 3. Métricas de Deslocamento ADE e FDE por Time (Ataque vs Defesa)
-results_by_team <- test_predictions |>
-  group_by(team_code) |>
-  summarize(
-    ADE = round(mean(distance, na.rm = TRUE), 2),
-    FDE = round(mean(distance[time_step == max(time_step)], na.rm = TRUE), 2),
-    .groups = "drop"
-  )
-
-cat("\n=== MÉTRICAS DE ERRO DE PREDIÇÃO POR PAPEL TÁTICO ===\n")
-print(results_by_team)
-
-# 4. Métricas ADE e FDE por Lance (Jogada)
-results_by_event <- test_predictions |>
-  group_by(event_id) |>
-  summarize(
-    ADE = round(mean(distance, na.rm = TRUE), 2),
-    FDE = round(mean(distance[time_step == max(time_step)], na.rm = TRUE), 2),
-    Coverage = round(mean(covered), 3),
-    .groups = "drop"
-  )
-
-head(results_by_event, 10)
-
-# 5. Comparação Baseline (E0) vs Modelo Final
-comparison <- data.frame(
-  modelo = c("E0 — Baseline", paste0("Final — ", final_tag)),
-  ADE_teste_m = c(e0$test_ade, round(final_overall$ADE, 2)),
-  FDE_teste_m = c(e0$test_fde, round(final_overall$FDE, 2)),
-  cobertura_sim = c(e0$cov_sim, round(coverage_simultaneous$empirical_coverage, 3)),
-  raio_medio_t5_m = c(e0$radius_t5, round(coverage_pointwise$mean_radius[coverage_pointwise$time_step == 5], 2))
-)
-print(comparison)
+cat(sprintf("MODELO FINAL  — Teste: ADE = %.2f m | FDE = %.2f m\n", final_overall$ADE, final_overall$FDE))
 
 
-# ==========================================================================
-# NOTA (Seções 3, 4.x e 9 do notebook — documentação, não executadas aqui):
-#   - Diagnóstico do baseline: W1 interação congelada no horizonte, W2 sem
-#     prior cinemático (extrapolação CV pura: ADE 6,15 / FDE 11,45 m).
-#   - Fundamentação: Social-LSTM (Alahi et al. 2016), Social GAN (Gupta et
-#     al. 2018), STGAT (Huang et al. 2019), Social-BiGAT (Kosaraju et al.
-#     2019) — adaptação para regressão determinística, sem GAN/VAE.
-#   - Resultados documentados: E3 final (val FDE 6,55); teste ADE 3,86 m /
-#     FDE 6,28 m; cobertura simultânea 88,9% (alvo 90%); q_hat 3,42 com 24
-#     jogadas de calibração. Trabalho futuro: cross-conformal (Vovk 2015;
-#     Barber et al. 2021) e escala adaptativa s_hat_t(x_i) para estabilizar
-#     q_hat (Izbicki, §4-§5).
-# ==========================================================================
