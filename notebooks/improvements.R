@@ -1,9 +1,25 @@
 # ==========================================================================
-#   5. Execução: carregamento dos dados & janelas
-#   6. Experimento E3_mirror
-#   7. Calibração conforme & predições no teste
-#   8. Plot da jogada de teste
-#   9. Avaliação & tabelas de resultados
+#   0. SETUP
+#   1. PRÉ-PROCESSAMENTO & CONSTRUÇÃO DO DATASET
+#   2. DEFINIÇÃO DO MODELO
+#   3. TREINO
+#   4. INFRAESTRUTURA CONFORME
+#   5. CALIBRAÇÃO: RISK CONTROL & CROSS-CONFORMAL
+#   6. EXECUÇÃO: DADOS & MODELO SPLIT-CONFORMAL
+#   7. RESÍDUOS OOF DO TREINO: MODELO DE ESCALA
+#   8. CALIBRAÇÃO & PREDIÇÕES NO TESTE
+#   9. CROSS-CONFORMAL
+#   10. AVALIAÇÃO & PLOT DA JOGADA
+#
+#   Implementa os itens 1-6 de docs/conformal_trajetórias-1.pdf:
+#     1. Um único score para a trajetória completa (em vez de um quantil por horizonte);
+#     2. r_t = q_hat * s_hat_t, com s_hat_t estimado por resíduos out-of-fold do treino;
+#     3. Unidade de calibração = (jogada, jogador) — Alvo B obtido APENAS via risk
+#        control (item 6): a Seção 6 substitui a Seção 3 do pdf (o ingênuo não
+#        tem garantia de amostra finita e a variante exata descarta 19/20 dos dados);
+#     4. Escala adaptativa s_hat_t(x_i) = exp(g(x_i, t)) sobre o estado latente da rede;
+#     5. Cross-conformal (Vovk 2015; Barber et al. 2021) com dobras por jogada;
+#     6. Conformal risk control (Angelopoulos et al. 2024): E[L_nova(lambda_hat)] <= alpha.
 # ==========================================================================
 
 
@@ -229,7 +245,10 @@ TrajectorySeq2SeqGNNv2 <- nn_module(
     self$mu_vel <- nn_buffer(torch_tensor(scaler$center[c("vel_x", "vel_y")])$view(c(1, 2)))
   },
 
-  forward = function(batch) {
+  # Encoder espaçotemporal: devolve o estado latente h_i(T_obs) por jogador
+  # e a cinemática do último frame observado. h_i(T_obs) é a representação
+  # congelada da rede usada como preditor do modelo de escala (item 4).
+  encode = function(batch) {
     x_cont <- batch$x_cont       # [num_nodes, seq_len = 25, cont_dim = 8]
     team_idx <- batch$x_cat[, 1] # [num_nodes]
     role_idx <- batch$x_cat[, 2] # [num_nodes]
@@ -237,16 +256,12 @@ TrajectorySeq2SeqGNNv2 <- nn_module(
     num_nodes <- x_cont$shape[1]
     seq_len <- x_cont$shape[2]
 
-    # Cinemática no último frame observado (t = 25)
-    last_known_pos <- x_cont[, seq_len, 1:2] 
-    last_known_vel <- x_cont[, seq_len, 7:8] 
-
     # Embeddings
     team_feat <- self$team_emb(team_idx)$unsqueeze(2)$expand(c(-1, seq_len, -1))
     role_feat <- self$role_emb(role_idx)$unsqueeze(2)$expand(c(-1, seq_len, -1))
 
     x_in <- torch_cat(list(x_cont, team_feat, role_feat), dim = 3)
-    x_proj <- self$feat_proj(x_in) 
+    x_proj <- self$feat_proj(x_in)
 
     # Camada Espacial: atenção entre jogadores a cada instante (histórico)
     x_spatial_in <- x_proj$transpose(1, 2) # [seq_len, num_nodes, hidden_dim]
@@ -255,9 +270,25 @@ TrajectorySeq2SeqGNNv2 <- nn_module(
     x_spatio_temporal <- self$dropout1(x_spatio_temporal)
 
     # Codificador Temporal
-    enc_out <- self$temporal_encoder(x_spatio_temporal)
-    enc_states <- enc_out[[1]] 
-    last_hidden <- enc_states[, seq_len, ] # [num_nodes, hidden_dim]
+    enc_states <- self$temporal_encoder(x_spatio_temporal)[[1]]
+
+    list(
+      last_hidden = enc_states[, seq_len, ],   # [num_nodes, hidden_dim]
+      last_known_pos = x_cont[, seq_len, 1:2], # [num_nodes, 2]
+      last_known_vel = x_cont[, seq_len, 7:8], # [num_nodes, 2]
+      num_nodes = num_nodes,
+      seq_len = seq_len
+    )
+  },
+
+  forward = function(batch, return_latents = FALSE) {
+    enc <- self$encode(batch)
+
+    num_nodes <- enc$num_nodes
+    seq_len <- enc$seq_len
+    last_hidden <- enc$last_hidden
+    last_known_pos <- enc$last_known_pos
+    last_known_vel <- enc$last_known_vel
 
     # Contexto Global (Social Max-Pooling invariante à permutação)
     global_ctx <- last_hidden$max(dim = 1, keepdim = TRUE)[[1]] # [1, hidden_dim]
@@ -306,7 +337,11 @@ TrajectorySeq2SeqGNNv2 <- nn_module(
     }
 
     preds_tensor <- torch_cat(preds, dim = 2) # [num_nodes, 5, 2]
-    return(preds_tensor)
+
+    if (return_latents) {
+      return(list(preds = preds_tensor, last_hidden = last_hidden))
+    }
+    preds_tensor
   }
 )
 
@@ -314,16 +349,22 @@ TrajectorySeq2SeqGNNv2 <- nn_module(
 # ==========================================================================
 # 3. TREINO
 # ==========================================================================
-compute_ade_loss_and_fde <- function(preds, targets, scaler) {
+
+# Tensores de média/desvio para desescalonar posições (x, y)
+mu_sd_tensors <- function(scaler, device) {
   mu <- c(scaler$center["x"], scaler$center["y"])
   sd <- c(scaler$scale["x"], scaler$scale["y"])
-  device <- preds$device
+  list(
+    mu = torch_tensor(mu, device = device)$view(c(1, 1, 2)),
+    sd = torch_tensor(sd, device = device)$view(c(1, 1, 2))
+  )
+}
 
-  mu_tensor <- torch_tensor(mu, device = device)$view(c(1, 1, 2))
-  sd_tensor <- torch_tensor(sd, device = device)$view(c(1, 1, 2))
+compute_ade_loss_and_fde <- function(preds, targets, scaler) {
+  ts <- mu_sd_tensors(scaler, preds$device)
 
-  preds_real <- preds * sd_tensor + mu_tensor
-  targets_real <- targets * sd_tensor + mu_tensor
+  preds_real <- preds * ts$sd + ts$mu
+  targets_real <- targets * ts$sd + ts$mu
 
   diff_sq <- (preds_real - targets_real)$pow(2)
   distances <- torch_sqrt(diff_sq$sum(dim = 3) + 1e-8)
@@ -361,53 +402,43 @@ EarlyStopping <- R6Class("EarlyStopping",
   )
 )
 
-run_experiment <- function(df_raw) {
-  # Reproduzibilidade estrita (seed 42)
-  set.seed(42)
-  torch_manual_seed(42)
-
-  device <- if (cuda_is_available()) {
+select_device <- function() {
+  if (cuda_is_available()) {
     torch_device("cuda")
   } else if (backends_mps_is_available()) {
     torch_device("mps")
   } else {
     torch_device("cpu")
   }
+}
 
-  prep_data <- preprocess_and_build_dataset(df_raw)
-  graphs <- prep_data$graphs
-  splits <- prep_data$splits
-  scaler <- prep_data$scaler
+# Treino de uma rede a partir de datasets prontos; devolve o modelo com os
+# melhores pesos da validação restaurados. Semente própria por chamada.
+train_model <- function(train_dataset, val_dataset, num_teams, scaler, cfg, seed, verbose = TRUE) {
+  set.seed(seed)
+  torch_manual_seed(seed)
 
-  train_dataset <- TrajectoryDataset(graphs[splits$train])
-  val_dataset <- TrajectoryDataset(graphs[splits$val])
-  calib_dataset <- TrajectoryDataset(graphs[splits$calib])
-  test_dataset <- TrajectoryDataset(graphs[splits$test])
+  device <- select_device()
 
   train_loader <- dataloader(train_dataset, batch_size = 1, shuffle = TRUE, collate_fn = custom_collate)
   val_loader <- dataloader(val_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
-  calib_loader <- dataloader(calib_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
 
   model <- TrajectorySeq2SeqGNNv2$new(
-    num_teams = prep_data$num_teams,
+    num_teams = num_teams,
     scaler = scaler
   )$to(device = device)
 
   n_params <- sum(sapply(model$parameters, function(p) p$numel()))
 
   # Configuração de treino do E3_mirror (inalterada em relação ao notebook)
-  lr <- 0.001
-  max_epochs <- 100
-  patience <- 10
-
-  optimizer <- optim_adam(model$parameters, lr = lr, weight_decay = 1e-5)
+  optimizer <- optim_adam(model$parameters, lr = cfg$lr, weight_decay = cfg$weight_decay)
   scheduler <- lr_reduce_on_plateau(optimizer, mode = "min", factor = 0.5, patience = 2)
-  early_stopping <- EarlyStopping$new(patience = patience)
+  early_stopping <- EarlyStopping$new(patience = cfg$patience)
 
   history <- data.frame(epoch = integer(), train_ade = numeric(), train_fde = numeric(),
                         val_ade = numeric(), val_fde = numeric())
 
-  for (epoch in 1:max_epochs) {
+  for (epoch in 1:cfg$max_epochs) {
     model$train()
     train_ade <- 0
     train_fde <- 0
@@ -467,14 +498,14 @@ run_experiment <- function(df_raw) {
 
     scheduler$step(val_fde)
 
-    if (epoch %% 5 == 0 || epoch == 1) {
+    if (verbose && (epoch %% 5 == 0 || epoch == 1)) {
       cat(sprintf("Época %03d | Treino ADE: %.2f m, FDE: %.2f m | Val ADE: %.2f m, FDE: %.2f m\n",
                   epoch, train_ade, train_fde, val_ade, val_fde))
     }
 
     early_stopping$step(val_fde, model)
     if (early_stopping$early_stop) {
-      cat(sprintf("Early stopping atingido na época %d.\n", epoch))
+      if (verbose) cat(sprintf("Early stopping atingido na época %d.\n", epoch))
       break
     }
   }
@@ -488,9 +519,6 @@ run_experiment <- function(df_raw) {
 
   list(
     model = model,
-    test_dataset = test_dataset,
-    calib_loader = calib_loader,
-    scaler = scaler,
     history = history,
     n_params = n_params,
     val_ade_best = min(history$val_ade),
@@ -498,174 +526,375 @@ run_experiment <- function(df_raw) {
   )
 }
 
+# Modelo split-conformal: treina apenas nas jogadas de treino (a calibração
+# permanece intacta) e devolve também os datasets dos demais conjuntos.
+run_experiment <- function(df_raw, cfg) {
+  prep_data <- preprocess_and_build_dataset(df_raw)
+  graphs <- prep_data$graphs
+  splits <- prep_data$splits
+  scaler <- prep_data$scaler
 
-# ==========================================================================
-# 4. PREDIÇÃO CONFORME: CALIBRAÇÃO & INFERÊNCIA
-# ==========================================================================
+  train_dataset <- TrajectoryDataset(graphs[splits$train])
+  val_dataset <- TrajectoryDataset(graphs[splits$val])
 
-# Quantil conforme com correção exata de amostra finita:
-# ceil((n + 1) * (1 - alpha)) / n
-finite_sample_quantile_level <- function(n, alpha) {
-  min(1.0, ceiling((n + 1) * (1 - alpha)) / n)
-}
+  fit <- train_model(
+    train_dataset = train_dataset,
+    val_dataset = val_dataset,
+    num_teams = prep_data$num_teams,
+    scaler = scaler,
+    cfg = cfg,
+    seed = cfg$seed
+  )
 
-# Forma temporal típica do erro s_hat (mediana dos erros a cada horizonte, piso 1e-4)
-band_shape <- function(err_matrix) {
-  s_hat <- apply(err_matrix, 2, median)
-  s_hat[s_hat < 1e-4] <- 1e-4
-  s_hat
-}
-
-# Escore por trajetória de jogador: R_i = max_{t in 1:5} (e_{i,t} / s_hat_t)
-score_supremum_trajectory <- function(err_matrix, s_hat) {
-  apply(err_matrix, 1, function(row) max(row / s_hat))
-}
-
-# Coleta dos erros de calibração (laço estável: não muda ao trocar escores)
-compute_calibration_errors <- function(model, calib_loader, scaler) {
-  model$eval()
-  device <- model$parameters[[1]]$device
-
-  mu <- c(scaler$center["x"], scaler$center["y"])
-  sd <- c(scaler$scale["x"], scaler$scale["y"])
-  mu_tensor <- torch_tensor(mu, device = device)$view(c(1, 1, 2))
-  sd_tensor <- torch_tensor(sd, device = device)$view(c(1, 1, 2))
-
-  all_player_errors <- list()
-
-  with_no_grad({
-    coro::loop(for (batch in calib_loader) {
-      batch$x_cont <- batch$x_cont$to(device = device)
-      batch$x_cat <- batch$x_cat$to(device = device)
-      batch$y <- batch$y$to(device = device)
-
-      preds <- model(batch)
-
-      preds_real <- preds * sd_tensor + mu_tensor
-      y_true_real <- batch$y * sd_tensor + mu_tensor
-
-      diff_sq <- (preds_real - y_true_real)$pow(2)
-      distances <- torch_sqrt(diff_sq$sum(dim = 3) + 1e-8) # [num_nodes, 5]
-      dist_mat <- as.matrix(distances$cpu())
-
-      all_player_errors[[length(all_player_errors) + 1]] <- dist_mat
-    })
-  })
-
-  list(
-    err_matrix = do.call(rbind, all_player_errors), # [total_trajetórias, 5]
-    all_player_errors = all_player_errors
+  c(
+    fit,
+    list(
+      prep_data = prep_data,
+      scaler = scaler,
+      train_dataset = train_dataset,
+      val_dataset = val_dataset,
+      calib_dataset = TrajectoryDataset(graphs[splits$calib]),
+      test_dataset = TrajectoryDataset(graphs[splits$test])
+    )
   )
 }
 
-# Calibração: devolve s_hat, quantil e raios simultâneos r_t
-calibrate_conformal <- function(model, calib_loader, scaler, alpha = 0.10) {
-  errs <- compute_calibration_errors(model, calib_loader, scaler)
-  err_matrix <- errs$err_matrix
-  all_player_errors <- errs$all_player_errors
 
-  n_players <- nrow(err_matrix)
-  n_events <- length(all_player_errors)
+# ==========================================================================
+# 4. INFRAESTRUTURA CONFORME
+# ==========================================================================
 
-  # Passo 1: Forma temporal típica do erro s_hat
-  s_hat <- band_shape(err_matrix)
-
-  # Passo 2: Escore de não-conformidade por trajetória
-  R_player <- score_supremum_trajectory(err_matrix, s_hat)
-
-  # Passo 3: Quantil conforme com correção exata de amostra finita
-  q_hat_player <- quantile(R_player, probs = finite_sample_quantile_level(n_players, alpha), names = FALSE)
-  r_simultaneous <- q_hat_player * s_hat
-
-  cat(sprintf("\n=== CALIBRAÇÃO CONFORME RIGOROSA (alpha = %.2f) ===\n", alpha))
-  cat(sprintf("Amostra de Calibração: %d jogadas independentes (%d trajetórias)\n", n_events, n_players))
-  cat("Forma da banda s_hat (medianas em metros):", round(s_hat, 2), "\n")
-  cat(sprintf("Quantil Conforme Simultâneo: %.3f\n", q_hat_player))
-  cat("Raios Conformes Simultâneos (r_t em metros):", round(r_simultaneous, 2), "\n\n")
-
-  list(
-    s_hat = s_hat,
-    q_hat_player = q_hat_player,
-    r_simultaneous = r_simultaneous,
-    alpha = alpha
-  )
-}
-
-predict_with_regions <- function(model, dataset, scaler, r_t) {
+# Predições, erros e estados latentes de um dataset numa única passada.
+# Uma linha por (jogador, horizonte); a coluna `latent` guarda h_i(T_obs).
+collect_predictions <- function(model, dataset, scaler) {
   model$eval()
   device <- model$parameters[[1]]$device
-
-  mu <- c(scaler$center["x"], scaler$center["y"])
-  sd <- c(scaler$scale["x"], scaler$scale["y"])
-  mu_tensor <- torch_tensor(mu, device = device)$view(c(1, 1, 2))
-  sd_tensor <- torch_tensor(sd, device = device)$view(c(1, 1, 2))
+  ts <- mu_sd_tensors(scaler, device)
 
   loader <- dataloader(dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
-  results_df <- list()
+  rows <- list()
 
   with_no_grad({
     coro::loop(for (batch in loader) {
-      evt_id <- batch$event_id
-      player_ids <- batch$player_ids
-      team_codes <- batch$team_codes
-      team_names <- batch$team_names
-
       batch$x_cont <- batch$x_cont$to(device = device)
       batch$x_cat <- batch$x_cat$to(device = device)
       batch$y <- batch$y$to(device = device)
 
-      preds <- model(batch)
+      out <- model(batch, return_latents = TRUE)
 
-      preds_real <- preds * sd_tensor + mu_tensor
-      y_true_real <- batch$y * sd_tensor + mu_tensor
+      preds_real <- out$preds * ts$sd + ts$mu
+      y_true_real <- batch$y * ts$sd + ts$mu
 
-      preds_arr <- as.array(preds_real$cpu())
+      preds_arr <- as.array(preds_real$cpu())   # [num_nodes, 5, 2]
       y_true_arr <- as.array(y_true_real$cpu())
+      lat_arr <- as.matrix(out$last_hidden$cpu()) # [num_nodes, hidden_dim]
 
       num_nodes <- dim(preds_arr)[1]
-      seq_len <- dim(preds_arr)[2]
+      n_steps <- dim(preds_arr)[2]
 
-      for (node in 1:num_nodes) {
-        pid <- player_ids[node]
-        tcode <- team_codes[node]
-        tname <- team_names[node]
-
-        for (t in 1:seq_len) {
+      for (node in seq_len(num_nodes)) {
+        for (t in seq_len(n_steps)) {
           px <- preds_arr[node, t, 1]
           py <- preds_arr[node, t, 2]
           tx <- y_true_arr[node, t, 1]
           ty <- y_true_arr[node, t, 2]
-          rad <- r_t[t]
-          dist <- sqrt((px - tx)^2 + (py - ty)^2)
 
-          results_df[[length(results_df) + 1]] <- data.frame(
-            event_id = evt_id,
+          rows[[length(rows) + 1]] <- tibble(
+            event_id = batch$event_id,
+            player_id = batch$player_ids[node],
             node_id = node,
-            player_id = pid,
-            team_code = tcode,
-            team_name = tname,
+            team_code = batch$team_codes[node],
+            team_name = batch$team_names[node],
             time_step = t,
             pred_x = px,
             pred_y = py,
             true_x = tx,
             true_y = ty,
-            conf_radius = rad,
-            distance = dist,
-            covered = dist <= rad,
-            stringsAsFactors = FALSE
+            distance = sqrt((px - tx)^2 + (py - ty)^2),
+            latent = list(lat_arr[node, ])
           )
         }
       }
     })
   })
 
-  bind_rows(results_df)
+  bind_rows(rows)
+}
+
+# Escore de não-conformidade por trajetória (unidade = (jogada, jogador);
+# Alvo B obtido via risk control, item 6): R = max_t e_{i,t} / s_hat_{i,t}
+trajectory_scores <- function(pred_df) {
+  pred_df |>
+    group_by(event_id, player_id) |>
+    summarise(score = max(distance / s_hat), .groups = "drop")
+}
+
+# Quantil conforme = estatística de ordem ceil((n + 1) * (1 - alpha)) da
+# amostra ordenada de scores (item 2, Passo 2)
+conformal_quantile <- function(scores, alpha) {
+  n <- length(scores)
+  k <- min(n, ceiling((n + 1) * (1 - alpha)))
+  sort(scores)[k]
+}
+
+# Modelo de escala adaptativa (item 4): regressão ridge em log(e + eps) com
+# preditores (h_i(T_obs), t) — o estado latente congelado da rede e o
+# horizonte num único modelo. Ajustado SÓ com resíduos out-of-fold do treino.
+fit_scale_model <- function(train_preds, lambda = 0.1, eps = 1e-6) {
+  lat_mat <- do.call(rbind, train_preds$latent) # [n_traj*5, hidden_dim]
+  lat_center <- colMeans(lat_mat)
+  lat_scale <- apply(lat_mat, 2, sd)
+  lat_scale[lat_scale == 0] <- 1
+
+  Z <- sweep(sweep(lat_mat, 2, lat_center, "-"), 2, lat_scale, "/")
+
+  levels_t <- sort(unique(train_preds$time_step))
+  t_onehot <- model.matrix(~ 0 + factor(time_step), data = train_preds)
+
+  X <- cbind(Z, t_onehot)
+  y <- log(train_preds$distance + eps)
+
+  p <- ncol(X)
+  beta <- solve(crossprod(X) + lambda * diag(p), crossprod(X, y))
+
+  list(beta = beta, lat_center = lat_center, lat_scale = lat_scale, levels = levels_t)
+}
+
+# s_hat_t(x_i) = exp(g(x_i, t)) para novas trajetórias (item 4)
+predict_scale <- function(fit, pred_df) {
+  lat_mat <- do.call(rbind, pred_df$latent)
+  Z <- sweep(sweep(lat_mat, 2, fit$lat_center, "-"), 2, fit$lat_scale, "/")
+  t_onehot <- model.matrix(~ 0 + factor(time_step, levels = fit$levels), data = pred_df)
+
+  X <- cbind(Z, t_onehot)
+  as.numeric(exp(X %*% fit$beta))
+}
+
+# Regiões conformes: círculo C_t = {p : ||p - p_hat(t)||_2 <= q_hat * s_hat_t}
+# no horizonte t (item 2, Passo 3)
+add_conformal_regions <- function(pred_df, q_hat) {
+  pred_df |>
+    mutate(
+      conf_radius = q_hat * s_hat,
+      covered = distance <= conf_radius
+    )
+}
+
+# Cobertura empírica ao nível da trajetória, área média da região (eficiência)
+# e fração média de trajetórias fora da banda por jogada (alvo do item 6)
+coverage_summary <- function(pred_df) {
+  cov_traj <- pred_df |>
+    group_by(event_id, player_id) |>
+    summarise(covered_all = all(covered), .groups = "drop")
+
+  list(
+    coverage = mean(cov_traj$covered_all),
+    mean_area = pi * mean(pred_df$conf_radius^2),
+    frac_outside_play = mean(
+      pred_df |>
+        group_by(event_id) |>
+        summarise(frac_out = mean(!covered), .groups = "drop") |>
+        pull(frac_out)
+    )
+  )
 }
 
 
 # ==========================================================================
-# 5. EXECUÇÃO
+# 5. CALIBRAÇÃO: RISK CONTROL & CROSS-CONFORMAL
 # ==========================================================================
+
+# Conformal risk control (item 6; Angelopoulos et al. 2024): perda por jogada
+# L_k(lambda) = fração de trajetórias com score > lambda (não crescente em
+# lambda). lambda_hat = inf{lambda : (sum_k L_k(lambda) + 1) / (n + 1) <= alpha}
+# garante E[L_nova(lambda_hat)] <= alpha, média sobre jogadas novas.
+risk_control_lambda <- function(scores_df, alpha) {
+  n_plays <- n_distinct(scores_df$event_id)
+  scores_by_play <- split(scores_df$score, scores_df$event_id)
+
+  loss_sum <- function(lambda) {
+    sum(sapply(scores_by_play, function(s) mean(s > lambda)))
+  }
+
+  threshold <- alpha * (n_plays + 1) - 1
+  candidates <- sort(unique(scores_df$score))
+
+  lambda_hat <- NA_real_
+  for (lambda in candidates) {
+    if (loss_sum(lambda) <= threshold) {
+      lambda_hat <- lambda
+      break
+    }
+  }
+  if (is.na(lambda_hat)) lambda_hat <- max(candidates)
+  lambda_hat
+}
+
+# Índices dos grafos cujas jogadas estão em play_ids (inclui os espelhos)
+graph_indices_for_plays <- function(graphs, play_ids) {
+  which(sapply(graphs, function(g) g$event_id) %in% play_ids)
+}
+
+# Apenas a primeira ocorrência de cada jogada (descarta os espelhos), usada na
+# coleta de scores e de resíduos out-of-fold para que cada jogada contribua
+# uma única vez
+first_graph_indices_for_plays <- function(graphs, play_ids) {
+  idx <- graph_indices_for_plays(graphs, play_ids)
+  idx[!duplicated(sapply(graphs[idx], function(g) g$event_id))]
+}
+
+# Jogadas (únicas) dos grafos nos índices dados
+play_ids_for_indices <- function(graphs, idx) {
+  unique(sapply(graphs[idx], function(g) g$event_id))
+}
+
+# Resíduos out-of-fold do treino (item 4): K dobras internas das jogadas de
+# treino; cada jogada recebe predição de uma rede treinada sem ela e contribui
+# UMA ÚNICA vez (o espelho não entra nos resíduos — seria a mesma jogada duas
+# vezes). Os resíduos alimentam o modelo de escala.
+compute_oof_train_errors <- function(prep, train_cfg, k = 5) {
+  graphs <- prep$graphs
+  val_dataset <- TrajectoryDataset(graphs[prep$splits$val])
+  train_plays <- play_ids_for_indices(graphs, prep$splits$train)
+
+  set.seed(train_cfg$seed)
+  folds <- split(train_plays, sample(rep(seq_len(k), length.out = length(train_plays))))
+
+  fold_preds <- list()
+
+  for (fold in seq_len(k)) {
+    cat(sprintf("Resíduos OOF do treino: dobra %d/%d\n", fold, k))
+    fit_plays <- setdiff(train_plays, folds[[fold]])
+
+    net <- train_model(
+      train_dataset = TrajectoryDataset(graphs[graph_indices_for_plays(graphs, fit_plays)]),
+      val_dataset = val_dataset,
+      num_teams = prep$num_teams,
+      scaler = prep$scaler,
+      cfg = train_cfg,
+      seed = train_cfg$seed + fold,
+      verbose = FALSE
+    )$model
+
+    fold_preds[[fold]] <- collect_predictions(
+      net,
+      TrajectoryDataset(graphs[first_graph_indices_for_plays(graphs, folds[[fold]])]),
+      prep$scaler
+    )
+  }
+
+  bind_rows(fold_preds)
+}
+
+# Cross-conformal (item 5; Vovk 2015; Barber et al. 2021): K dobras por jogada
+# completa (a jogada e seu espelho nunca são divididos entre dobras; jogadores
+# e instantes de uma mesma jogada nunca mudam de dobra). Para cada dobra k:
+# (i) split interno das K-1 dobras (80/20) gera resíduos OOF que ajustam o
+# modelo de escala da dobra; (ii) a rede treinada nas K-1 dobras completas
+# calcula os scores da dobra k; (iii) os scores das K dobras são reunidos e
+# q_hat é obtido como no item 2. A rede final treina em todos os dados
+# (treino + calibração) e a jogada nova usa a média das K previsões dos
+# modelos de escala das dobras (Passo 4); a validação fica reservada ao early
+# stopping.
+cross_conformal <- function(prep, train_cfg, cf_cfg, k = 5) {
+  graphs <- prep$graphs
+  val_dataset <- TrajectoryDataset(graphs[prep$splits$val])
+
+  cc_plays <- unique(c(
+    play_ids_for_indices(graphs, prep$splits$train),
+    play_ids_for_indices(graphs, prep$splits$calib)
+  ))
+
+  set.seed(train_cfg$seed)
+  folds <- split(cc_plays, sample(rep(seq_len(k), length.out = length(cc_plays))))
+  fold_scores <- list()
+  scale_models <- list()
+
+  for (fold in seq_len(k)) {
+    cat(sprintf("Cross-conformal: dobra %d/%d\n", fold, k))
+    fold_plays <- folds[[fold]]
+    compl_plays <- setdiff(cc_plays, fold_plays)
+
+    # (i) split interno das K-1 dobras para os resíduos do modelo de escala
+    set.seed(train_cfg$seed + 100 * fold)
+    scale_fit_plays <- sample(compl_plays, floor(0.8 * length(compl_plays)))
+    scale_resid_plays <- setdiff(compl_plays, scale_fit_plays)
+
+    scale_net <- train_model(
+      train_dataset = TrajectoryDataset(graphs[graph_indices_for_plays(graphs, scale_fit_plays)]),
+      val_dataset = val_dataset,
+      num_teams = prep$num_teams,
+      scaler = prep$scaler,
+      cfg = train_cfg,
+      seed = train_cfg$seed + 100 * fold + 1,
+      verbose = FALSE
+    )$model
+    scale_resid_preds <- collect_predictions(
+      scale_net,
+      TrajectoryDataset(graphs[first_graph_indices_for_plays(graphs, scale_resid_plays)]),
+      prep$scaler
+    )
+    scale_model_k <- fit_scale_model(scale_resid_preds, lambda = cf_cfg$scale_lambda, eps = cf_cfg$scale_eps)
+    scale_models[[fold]] <- scale_model_k
+
+    # (ii) rede completa das K-1 dobras -> scores da dobra k
+    fold_net <- train_model(
+      train_dataset = TrajectoryDataset(graphs[graph_indices_for_plays(graphs, compl_plays)]),
+      val_dataset = val_dataset,
+      num_teams = prep$num_teams,
+      scaler = prep$scaler,
+      cfg = train_cfg,
+      seed = train_cfg$seed + 100 * fold + 2,
+      verbose = FALSE
+    )$model
+
+    fold_preds <- collect_predictions(
+      fold_net,
+      TrajectoryDataset(graphs[first_graph_indices_for_plays(graphs, fold_plays)]),
+      prep$scaler
+    )
+    fold_preds$s_hat <- predict_scale(scale_model_k, fold_preds)
+
+    fold_scores[[fold]] <- trajectory_scores(fold_preds) |> mutate(fold = fold)
+  }
+
+  scores <- bind_rows(fold_scores)
+  q_hat <- conformal_quantile(scores$score, cf_cfg$alpha)
+
+  # (iii) rede final: treino em todos os dados (treino + calibração)
+  final_fit <- train_model(
+    train_dataset = TrajectoryDataset(graphs[graph_indices_for_plays(graphs, cc_plays)]),
+    val_dataset = val_dataset,
+    num_teams = prep$num_teams,
+    scaler = prep$scaler,
+    cfg = train_cfg,
+    seed = train_cfg$seed + 1000
+  )
+
+  list(q_hat = q_hat, scores = scores, final_model = final_fit$model, scale_models = scale_models)
+}
+
+
+# ==========================================================================
+# 6. EXECUÇÃO: DADOS & MODELO SPLIT-CONFORMAL
+# ==========================================================================
+
+# Configurações do experimento (sementes explícitas em todo treino)
+train_cfg <- list(
+  seed = 42,
+  lr = 0.001,
+  max_epochs = 100,
+  patience = 10,
+  weight_decay = 1e-5
+)
+
+conformal_cfg <- list(
+  alpha = 0.10,
+  k_folds = 5,
+  scale_lambda = 0.1,
+  scale_eps = 1e-6
+)
+
 events <- read_csv(here('data', 'processed', 'events.csv'), show_col_types = FALSE) |> 
   distinct() |> 
   rename(team_with_poss = team_id) |> 
@@ -691,11 +920,12 @@ events_prepared <- prepare_data(
 )
 
 
-res <- run_experiment(events_prepared)
+res <- run_experiment(events_prepared, train_cfg)
 
 model <- res$model
+prep <- res$prep_data
 test_dataset <- res$test_dataset
-calib_loader <- res$calib_loader
+calib_dataset <- res$calib_dataset
 scaler <- res$scaler
 
 cat(sprintf("\nValidação: ADE %.2f m | FDE %.2f m | %d parâmetros\n",
@@ -703,26 +933,76 @@ cat(sprintf("\nValidação: ADE %.2f m | FDE %.2f m | %d parâmetros\n",
 
 
 # ==========================================================================
-# 6. CALIBRAÇÃO CONFORME & PREDIÇÕES NO TESTE
+# 7. RESÍDUOS OOF DO TREINO: MODELO DE ESCALA (item 4)
 # ==========================================================================
-# 1. Calibração Conforme no conjunto independente (metodologia inalterada)
-alpha_level <- 0.10
-conformal_calib <- calibrate_conformal(
-  model = model, 
-  calib_loader = calib_loader, 
-  scaler = scaler, 
-  alpha = alpha_level
+# s_hat_t(x_i) é estimado exclusivamente com resíduos out-of-fold do treino
+# (o modelo de escala do item 4 usa apenas dados de treino — nunca calibração).
+oof_train_preds <- compute_oof_train_errors(prep, train_cfg, k = conformal_cfg$k_folds)
+
+scale_model <- fit_scale_model(
+  oof_train_preds,
+  lambda = conformal_cfg$scale_lambda,
+  eps = conformal_cfg$scale_eps
 )
 
-# 2. Inferência Conforme no Conjunto de Teste
-test_predictions <- predict_with_regions(
-  model = model, 
-  dataset = test_dataset, 
-  scaler = scaler, 
-  r_t = conformal_calib$r_simultaneous
+
+# ==========================================================================
+# 8. CALIBRAÇÃO & PREDIÇÕES NO TESTE (itens 2, 4 e 6)
+# ==========================================================================
+alpha_level <- conformal_cfg$alpha
+
+calib_preds <- collect_predictions(model, calib_dataset, scaler)
+test_preds <- collect_predictions(model, test_dataset, scaler)
+
+# Escala adaptativa — item 4: s_hat_t(x_i) = exp(g(x_i, t))
+calib_preds$s_hat <- predict_scale(scale_model, calib_preds)
+calib_scores_adapt <- trajectory_scores(calib_preds)
+
+test_preds$s_hat <- predict_scale(scale_model, test_preds)
+
+# Alvo B via conformal risk control — item 6 (a Seção 6 do pdf substitui a
+# Seção 3): L_k(lambda) = fração de jogadores da jogada k com score > lambda;
+# lambda_hat = inf{lambda : (sum_k L_k(lambda) + 1) / (n + 1) <= alpha} garante
+# E[L_nova(lambda_hat)] <= alpha, com a jogada como unidade permutável.
+lambda_hat <- risk_control_lambda(calib_scores_adapt, alpha_level)
+test_rc <- add_conformal_regions(test_preds, lambda_hat)
+
+cat(sprintf("\n=== SPLIT-CONFORMAL — ALVO B VIA RISK CONTROL (alpha = %.2f) ===\n", alpha_level))
+cat(sprintf("lambda_hat (risk control): %.3f\n", lambda_hat))
+
+
+# ==========================================================================
+# 9. CROSS-CONFORMAL (item 5)
+# ==========================================================================
+
+# Passo 4 do item 5: rede final treinada em todos os dados; s_hat_t(x_i) da
+# jogada nova = média das K previsões dos modelos de escala das dobras.
+cc <- cross_conformal(prep, train_cfg, conformal_cfg, k = conformal_cfg$k_folds)
+
+test_preds_cc <- collect_predictions(cc$final_model, test_dataset, scaler)
+scale_preds_cc <- lapply(cc$scale_models, predict_scale, pred_df = test_preds_cc)
+test_preds_cc$s_hat <- rowMeans(do.call(cbind, scale_preds_cc))
+test_cc <- add_conformal_regions(test_preds_cc, cc$q_hat)
+
+
+# ==========================================================================
+# 10. AVALIAÇÃO & PLOT DA JOGADA
+# ==========================================================================
+eval_rc <- coverage_summary(test_rc)
+eval_cc <- coverage_summary(test_cc)
+
+results_table <- tibble(
+  metodo = c(
+    "Risk control",
+    "Cross-conformal"
+  ),
+  quantil = c(lambda_hat, cc$q_hat),
+  cobertura = c(eval_rc$coverage, eval_cc$coverage),
+  area_media_m2 = c(eval_rc$mean_area, eval_cc$mean_area),
+  frac_fora_media_jogada = c(eval_rc$frac_outside_play, eval_cc$frac_outside_play)
 )
 
-head(test_predictions)
+results_table
 
 
 # Regiões conformes simultâneas de uma jogada no campo
@@ -813,7 +1093,9 @@ plot_conformal_event <- function(target_event_id, events_prepared, test_predicti
   return(p)
 }
 
-# Jogada de teste do modelo final
+# Plot com as regiões do risk control (item 6): raio = lambda_hat * s_hat_t(x_i)
+test_predictions <- test_rc
+
 test_events_available <- unique(test_predictions$event_id)
 cat("Lances disponíveis no Teste:", test_events_available, "\n")
 
@@ -829,12 +1111,21 @@ conf <- plot_conformal_event(
 conf
 
 
-final_overall <- test_predictions |>
-  summarize(
-    ADE = mean(distance, na.rm = TRUE),
-    FDE = mean(distance[time_step == max(time_step)], na.rm = TRUE),
-    .groups = "drop"
-  )
-cat(sprintf("MODELO FINAL  — Teste: ADE = %.2f m | FDE = %.2f m\n", final_overall$ADE, final_overall$FDE))
+overall_ade_fde <- function(pred_df) {
+  pred_df |>
+    summarize(
+      ADE = mean(distance, na.rm = TRUE),
+      FDE = mean(distance[time_step == max(time_step)], na.rm = TRUE),
+      .groups = "drop"
+    )
+}
 
+final_overall <- overall_ade_fde(test_predictions)
+cat(sprintf("MODELO SPLIT-CONFORMAL — Teste: ADE = %.2f m | FDE = %.2f m\n",
+            final_overall$ADE, final_overall$FDE))
 
+final_overall_cc <- overall_ade_fde(test_preds_cc)
+cat(sprintf("MODELO FINAL CROSS-CONFORMAL — Teste: ADE = %.2f m | FDE = %.2f m\n",
+            final_overall_cc$ADE, final_overall_cc$FDE))
+# Plot com as regiões do risk control (item 6): raio = lambda_hat * s_hat_t(x_i)
+test_predictions <- test_rc
