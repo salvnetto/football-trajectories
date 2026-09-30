@@ -1,0 +1,5 @@
+- Arrumar Codigo
+- Entender Conformal
+- Entender PDF
+- Entender Codigo nao muito
+- Aplicar PDF
