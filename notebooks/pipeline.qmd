@@ -44,6 +44,7 @@ res <- run_experiment(events_prepared, train_cfg)
 model <- res$model
 test_dataset <- res$test_dataset
 calib_dataset <- res$calib_dataset
+val_dataset <- res$val_dataset # fonte out-of-fold de ŝ_t (PDF §2, Passo 1)
 scaler <- res$scaler
 
 cat(sprintf("\nValidação: ADE %.2f m | FDE %.2f m | %d parâmetros\n",
@@ -89,11 +90,14 @@ cat(sprintf("Teste: ADE = %.2f m | FDE = %.2f m\n",
 # Predição conforme
 
 ```{r}
-# Calibração conforme no conjunto independente (sem duplo uso da validação)
+# Calibração conforme (PDF §2-§3): ŝ_t estimada com resíduos out-of-fold do
+# split de validação (nunca usado no treino); quantil no conjunto de calibração
+# independente. O Alvo B é conformal naive — cobertura empírica, não garantia.
 alpha_level <- 0.10
 conformal_calib <- calibrate_conformal(
   model = model,
   calib_dataset = calib_dataset,
+  s_hat_dataset = val_dataset,
   scaler = scaler,
   alpha = alpha_level
 )
@@ -175,4 +179,30 @@ results_by_event <- test_predictions |>
   )
 
 head(results_by_event, 10)
+```
+
+# Cobertura ao nível da jogada (Alvo B — conformal naive)
+
+O Alvo B é um **conformal naive** (PDF, Seção 3): as trajetórias de uma mesma jogada não
+são permutáveis com a trajetória de teste, portanto a cobertura reportada é um **resultado
+empírico, não uma garantia em amostra finita** — o tamanho efetivo de amostra é o número de
+jogadas, não o de trajetórias. A aferição prescrita pelo documento é a variante exata (um
+jogador sorteado por jogada de calibração): `q_hat_exact` próximo de `q_hat_player` indica
+que a dependência dentro da jogada não está atrapalhando (comparativo impresso na
+calibração).
+
+```{r}
+# (PDF, Seção 3) Cobertura empírica medida por repetições ao nível da jogada:
+# a cada repetição sorteia-se uma trajetória por jogada de teste.
+coverage_by_play <- coverage_by_play_draws(test_predictions, B = 200, seed = 7302)
+
+print(coverage_by_play)
+
+cat(sprintf(
+  "\nq̂ Alvo B naive: %.3f | q̂ variante exata: %.3f ± %.3f (n efetivo ≈ %d jogadas)\n",
+  conformal_calib$q_hat_player,
+  conformal_calib$q_hat_exact,
+  conformal_calib$q_hat_exact_sd,
+  conformal_calib$n_events
+))
 ```

@@ -537,18 +537,31 @@ run_experiment <- function(df_raw, cfg) {
 # ==========================================================================
 # 4. PREDIÇÃO CONFORME
 # ==========================================================================
-# Calibração split-conformal simultânea (Izbicki 2026 / Diquigiovanni et al.
-# 2022): o conjunto de calibração é formado por jogadas independentes (nunca
-# usadas no treino) e a forma temporal da banda s_hat_t é a mediana do erro
-# em cada horizonte; os escores são funcionais (supremo temporal) por
-# trajetória de jogador (Alvo B) e por jogada completa (Alvo A).
-calibrate_conformal <- function(model, calib_dataset, scaler, alpha = 0.10) {
+# Calibração split-conformal (Izbicki 2026; Diquigiovanni et al. 2022).
+#
+# (PDF Seção 1) Notação: jogada k, jogador i, horizonte t ∈ H = {26,...,30}
+# (passos 1:5 no código); e_{i,t} = ||p_i(t) - p̂_i(t)||_2 em metros.
+# (PDF Seção 2, Passo 1) ŝ_t = median_i e_{i,t}, estimada com resíduos
+# out-of-fold do treino (aqui: split de validação, nunca usado no treino).
+# (PDF Seção 2, Passo 2) R = max_{t∈H} e_t/ŝ_t; q̂ = estatística de ordem
+# ⌈(n+1)(1-α)⌉ da amostra ordenada dos R's.
+# (PDF Seção 2, Passo 3) C_t = {p : ||p - p̂(t)||_2 ≤ q̂·ŝ_t} (leitura simultânea).
+# (PDF Seção 3) Alvo B = par (jogada, jogador): conformal naive, sem garantia
+# exata nessa forma direta (trajetórias da mesma jogada não são permutáveis);
+# a variante exata (um jogador sorteado por jogada de calibração) serve de
+# aferição. Alvo A = jogada completa: R_k = max_i max_t e/ŝ_t, com garantia
+# finita válida (jogadas são permutáveis).
+
+# Resíduos e_{i,t} por (jogada, jogador, horizonte) em metros (PDF Seção 1).
+# Devolve uma matriz [n_jogadores, 5] por jogada e a matriz empilhada
+# [total_trajetórias, 5].
+compute_error_matrices <- function(model, dataset, scaler) {
   model$eval()
   device <- model$parameters[[1]]$device
   ts <- mu_sd_tensors(scaler, device)
 
-  loader <- dataloader(calib_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
-  all_player_errors <- list()
+  loader <- dataloader(dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
+  err_by_event <- list()
 
   with_no_grad({
     coro::loop(for (batch in loader) {
@@ -566,51 +579,107 @@ calibrate_conformal <- function(model, calib_dataset, scaler, alpha = 0.10) {
       distances <- torch_sqrt(diff_sq$sum(dim = 3) + 1e-8) # [num_nodes, 5]
       dist_mat <- as.matrix(distances$cpu())
 
-      all_player_errors[[length(all_player_errors) + 1]] <- dist_mat
+      err_by_event[[length(err_by_event) + 1]] <- dist_mat
     })
   })
 
-  err_matrix <- do.call(rbind, all_player_errors) # [total_trajetórias, 5]
-  n_players <- nrow(err_matrix)
-  n_events <- length(all_player_errors)
+  list(
+    err_by_event = err_by_event,
+    err_matrix = do.call(rbind, err_by_event) # [total_trajetórias, 5]
+  )
+}
 
-  # Passo 1: Forma temporal típica do erro s_hat (mediana dos erros a cada horizonte)
+# (PDF Seção 2, Passo 1) Forma temporal da banda: ŝ_t = median_i e_{i,t}.
+# O piso evita a explosão dos escores normalizados e_t/ŝ_t.
+estimate_band_shape <- function(err_matrix, floor_eps = 1e-4) {
   s_hat <- apply(err_matrix, 2, median)
-  s_hat[s_hat < 1e-4] <- 1e-4
+  s_hat[s_hat < floor_eps] <- floor_eps
+  s_hat
+}
 
-  # Passo 2: Escore de não-conformidade funcional supremo (Alvo B - por trajetória de jogador)
-  # R_i = max_{t in 1:5} (e_{i,t} / s_hat_t)
+# Calibração conforme: ŝ_t vem de resíduos out-of-fold (s_hat_dataset, PDF
+# Seção 2, Passo 1) e o conjunto de calibração é formado por jogadas
+# independentes (nunca usadas no treino nem na estimação de ŝ_t).
+#
+# Alvo B (PDF Seção 3): conformal naive por trajetória de jogador. A garantia
+# em amostra finita NÃO vale nessa forma direta (n efetivo = nº de jogadas,
+# não de trajetórias); a cobertura é reportada como resultado empírico. A
+# variante exata (um jogador sorteado por jogada de calibração) serve de
+# aferição: q̂ próximos indicam que a dependência intra-jogada não atrapalha.
+calibrate_conformal <- function(model, calib_dataset, s_hat_dataset, scaler,
+                                alpha = 0.10, n_exact_draws = 200,
+                                exact_seed = 7301) {
+  # ---- (PDF Seção 2, Passo 1) ŝ_t com resíduos out-of-fold do treino ----
+  s_hat_res <- compute_error_matrices(model, s_hat_dataset, scaler)
+  s_hat <- estimate_band_shape(s_hat_res$err_matrix)
+  n_events_s_hat <- length(s_hat_res$err_by_event)
+
+  # ---- (PDF Seção 2, Passo 2) escores no conjunto de calibração ----
+  calib_res <- compute_error_matrices(model, calib_dataset, scaler)
+  err_by_event <- calib_res$err_by_event
+  err_matrix <- calib_res$err_matrix
+
+  n_players <- nrow(err_matrix)
+  n_events <- length(err_by_event)
+
+  # (PDF Seção 3, Alvo B) R_{k,i} = max_{t∈H} e_{k,i,t} / ŝ_t
   R_player <- apply(err_matrix, 1, function(row) max(row / s_hat))
 
-  # Passo 3: Quantil conforme com garantia exata em amostra finita
+  # (PDF Seção 2, Passo 2) q̂ = estatística de ordem ⌈(n+1)(1-α)⌉ da amostra
+  # ordenada dos R's (quantil empírico com correção finita). No Alvo B naive,
+  # n = nº de trajetórias; o n efetivo é o nº de jogadas (PDF Seção 3).
   q_level_player <- min(1.0, ceiling((n_players + 1) * (1 - alpha)) / n_players)
   q_hat_player <- quantile(R_player, probs = q_level_player, names = FALSE)
 
-  # Raios simultâneos ao longo dos 5 segundos
+  # (PDF Seção 2, Passo 3) raios simultâneos r_t = q̂ · ŝ_t
   r_simultaneous <- q_hat_player * s_hat
 
-  # Escore por jogada completa (Alvo A - todas as trajetórias contidas na banda)
-  R_event <- sapply(all_player_errors, function(mat) {
+  # (PDF Seção 3, Alvo A) R_k = max_i max_{t∈H} e_{k,i,t} / ŝ_t por jogada
+  R_event <- sapply(err_by_event, function(mat) {
     max(apply(mat, 1, function(row) max(row / s_hat)))
   })
   q_level_event <- min(1.0, ceiling((n_events + 1) * (1 - alpha)) / n_events)
   q_hat_event <- quantile(R_event, probs = q_level_event, names = FALSE)
   r_event <- q_hat_event * s_hat
 
-  # Quantis pontuais marginais (apenas para contraste metodológico)
+  # (PDF Seção 3, "Como proceder") Variante exata do Alvo B (aferição):
+  # sorteando um jogador por jogada de calibração, as unidades voltam a ser
+  # permutáveis com a unidade de teste (um jogador sorteado de uma jogada
+  # nova), e a garantia é recuperada ao custo de 19/20 trajetórias.
+  q_level_exact <- min(1.0, ceiling((n_events + 1) * (1 - alpha)) / n_events)
+  set.seed(exact_seed)
+  q_hat_exact_draws <- replicate(n_exact_draws, {
+    R_exact <- sapply(err_by_event, function(mat) {
+      max(mat[sample.int(nrow(mat), size = 1), ] / s_hat)
+    })
+    quantile(R_exact, probs = q_level_exact, names = FALSE)
+  })
+  q_hat_exact <- mean(q_hat_exact_draws)
+  q_hat_exact_sd <- sd(q_hat_exact_draws)
+
+  # (PDF Seção 1) Quantis pontuais marginais por horizonte — o status quo que
+  # a banda simultânea substitui; mantido apenas como contraste metodológico.
   q_pointwise <- numeric(5)
   for (t in 1:5) {
     q_level_pw <- min(1.0, ceiling((n_players + 1) * (1 - alpha)) / n_players)
     q_pointwise[t] <- quantile(err_matrix[, t], probs = q_level_pw, names = FALSE)
   }
 
-  cat(sprintf("\n=== CALIBRAÇÃO CONFORME RIGOROSA (alpha = %.2f) ===\n", alpha))
-  cat(sprintf("Amostra de Calibração: %d jogadas independentes (%d trajetórias)\n", n_events, n_players))
-  cat("Forma da banda s_hat (medianas em metros):", round(s_hat, 2), "\n")
-  cat(sprintf("Quantil Conforme Simultâneo (Alvo B): %.3f\n", q_hat_player))
-  cat("Raios Conformes Simultâneos (r_t em metros):", round(r_simultaneous, 2), "\n")
-  cat(sprintf("Quantil por Jogada Completa (Alvo A): %.3f\n", q_hat_event))
-  cat("Raios Marginais Pontuais (q_pw em metros):", round(q_pointwise, 2), "\n\n")
+  cat(sprintf("\n=== CALIBRAÇÃO CONFORME (alpha = %.2f) ===\n", alpha))
+  cat(sprintf("ŝ_t estimada em %d jogadas out-of-fold (validação) — PDF §2, Passo 1\n",
+              n_events_s_hat))
+  cat("Forma da banda ŝ_t (medianas em metros):", round(s_hat, 2), "\n")
+  cat(sprintf("Calibração: %d jogadas independentes (%d trajetórias) — PDF §3\n",
+              n_events, n_players))
+  cat(sprintf("q̂ Alvo B naive (n = %d trajetórias; n efetivo ≈ %d jogadas): %.3f — PDF §3\n",
+              n_players, n_events, q_hat_player))
+  cat("Raios conformes simultâneos r_t = q̂·ŝ_t (metros):", round(r_simultaneous, 2), "— PDF §2, Passo 3\n")
+  cat(sprintf("q̂ variante exata Alvo B (%d sorteios, 1 jogador/jogada): %.3f ± %.3f — PDF §3, Como proceder\n",
+              n_exact_draws, q_hat_exact, q_hat_exact_sd))
+  cat(sprintf("q̂ Alvo A (jogada completa): %.3f — bandas largas por construção (PDF §3)\n",
+              q_hat_event))
+  cat("Raios Alvo A (metros):", round(r_event, 2), "\n")
+  cat("Quantis marginais pontuais (contraste PDF §1, em metros):", round(q_pointwise, 2), "\n\n")
 
   list(
     s_hat = s_hat,
@@ -619,7 +688,14 @@ calibrate_conformal <- function(model, calib_dataset, scaler, alpha = 0.10) {
     q_hat_event = q_hat_event,
     r_event = r_event,
     r_pointwise = q_pointwise,
-    alpha = alpha
+    alpha = alpha,
+    q_hat_exact = q_hat_exact,
+    q_hat_exact_sd = q_hat_exact_sd,
+    q_hat_exact_draws = q_hat_exact_draws,
+    n_players = n_players,
+    n_events = n_events,
+    n_events_s_hat = n_events_s_hat,
+    s_hat_source = "validacao_out_of_fold"
   )
 }
 
@@ -690,6 +766,34 @@ predict_with_regions <- function(model, dataset, scaler, r_t) {
   })
 
   bind_rows(results_df)
+}
+
+# (PDF Seção 3, "Como proceder") Cobertura empírica do Alvo B medida por
+# repetições ao nível da jogada: a cada repetição sorteia-se uma trajetória
+# por jogada de teste e calcula-se a fração coberta. A média pondera jogadas
+# igualmente (n efetivo = nº de jogadas); o DP quantifica a flutuação do
+# estimador entre repetições.
+coverage_by_play_draws <- function(test_predictions, B = 200, seed = 7302) {
+  set.seed(seed)
+
+  trajectories <- test_predictions |>
+    group_by(event_id, player_id) |>
+    summarize(trajectory_covered = all(covered), .groups = "drop")
+
+  covs <- replicate(B, {
+    trajectories |>
+      group_by(event_id) |>
+      slice_sample(n = 1) |>
+      pull(trajectory_covered) |>
+      mean()
+  })
+
+  tibble(
+    n_test_events = n_distinct(test_predictions$event_id),
+    n_draws = B,
+    mean_coverage = mean(covs),
+    sd_coverage = sd(covs)
+  )
 }
 
 

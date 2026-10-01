@@ -1,6 +1,15 @@
-# Football Trajectory Prediction with Conformal Regions
-
-Salvador Netto, Marcos O. Prates, Rafael Izbicki, Heitor S. Ramos
+---
+title: "Football Trajectory Prediction with Conformal Regions"
+author:
+  - Salvador Netto
+  - Marcos O. Prates
+  - Rafael Izbicki
+  - Heitor S. Ramos
+lang: en
+format:
+  pdf:
+    papersize: a4
+---
 
 ## Introduction
 
