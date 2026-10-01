@@ -1,7 +1,4 @@
----
-title: "Modelagem Espaçotemporal de Trajetórias no Futebol com Regiões Conformes"
-format: html
----
+
 
 ```{r setup, message=FALSE, warning=FALSE}
 library(torch)
