@@ -1,0 +1,85 @@
+
+```{r}
+source(here::here("notebooks", "architecture.R"))
+```
+
+# Dataset
+
+```{r}
+# Configurações do experimento (sementes explícitas em todo treino)
+train_cfg <- list(
+  seed = 42,
+  lr = 0.001,
+  max_epochs = 100,
+  patience = 10,
+  weight_decay = 1e-5
+)
+
+events <- read_csv(here('data', 'processed', 'events.csv'), show_col_types = FALSE) |>
+  distinct() |>
+  rename(team_with_poss = team_id) |>
+  mutate(event_id = as.integer(as.factor(event_id)))
+
+players_db <- read_csv(here('data', 'processed', 'players_database.csv'), show_col_types = FALSE) |>
+  select(player_id, team_name) |>
+  distinct()
+
+tracking <- read_csv(here('data', 'processed', 'tracking.csv'), show_col_types = FALSE) |>
+  distinct() |>
+  left_join(players_db, by = "player_id")
+
+# Janelas de 30 s centradas na finalização (25 observados + 5 alvo)
+events_prepared <- prepare_data(
+  events = events,
+  tracking = tracking,
+  event_type_filter = "SHOT",
+  event_subtype = NA,
+  start_time = 30,
+  end_time = 1,
+  pred_time_event = 1
+)
+
+res <- run_experiment(events_prepared, train_cfg)
+
+model <- res$model
+test_dataset <- res$test_dataset
+
+cat(sprintf("\nValidação: ADE %.2f m | FDE %.2f m | %d parâmetros\n",
+            res$val_ade_best, res$val_fde_best, res$n_params))
+```
+
+# Avaliação no teste
+
+```{r}
+# ADE/FDE do modelo final no conjunto de teste (média ponderada por jogador)
+evaluate_dataset <- function(model, dataset, scaler) {
+  model$eval()
+  device <- model$parameters[[1]]$device
+
+  loader <- dataloader(dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
+  ade_sum <- 0
+  fde_sum <- 0
+  n_nodes_total <- 0
+
+  with_no_grad({
+    coro::loop(for (batch in loader) {
+      batch$x_cont <- batch$x_cont$to(device = device)
+      batch$x_cat <- batch$x_cat$to(device = device)
+      batch$y <- batch$y$to(device = device)
+
+      metrics <- compute_ade_loss_and_fde(model(batch), batch$y, scaler)
+
+      n_nodes <- batch$num_nodes
+      ade_sum <- ade_sum + metrics$ade_loss$item() * n_nodes
+      fde_sum <- fde_sum + metrics$fde * n_nodes
+      n_nodes_total <- n_nodes_total + n_nodes
+    })
+  })
+
+  list(ADE = ade_sum / n_nodes_total, FDE = fde_sum / n_nodes_total)
+}
+
+test_metrics <- evaluate_dataset(model, test_dataset, res$scaler)
+cat(sprintf("Teste: ADE = %.2f m | FDE = %.2f m\n",
+            test_metrics$ADE, test_metrics$FDE))
+```

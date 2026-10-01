@@ -14,7 +14,7 @@ Predicting where every player will move next is central to football analytics. W
 
 ## Results
 
-On validation, the final model attains average displacement error (ADE) 4.06 m and final displacement error (FDE) 6.55 m; on the held-out test set, ADE 3.86 m and FDE 6.28 m, improving both attacking (3.78/6.25 m) and defending (3.93/6.31 m) players. At $\alpha=0.10$, the split-conformal pipeline reaches 88.9% empirical simultaneous coverage (target 90%) with $\hat q=3.42$; with only 24 calibration plays, however, $\hat q$ is a noisy statistic, motivating the refinements below. The four conformal variants were compared head-to-head: [FALTA PREENCHER].
+On validation, the final model attains average displacement error (ADE) 4.06 m and final displacement error (FDE) 6.55 m; on the held-out test set, ADE 3.86 m and FDE 6.28 m, improving both attacking (3.78/6.25 m) and defending (3.93/6.31 m) players. At $\alpha=0.10$, the split-conformal pipeline reaches 88.9% empirical simultaneous coverage (target 90%) with $\hat q=3.42$; with only 24 calibration plays, however, $\hat q$ is a noisy statistic.
 
 ## Conclusion
 
