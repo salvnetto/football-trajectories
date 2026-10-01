@@ -5,6 +5,8 @@ library(torch)
 library(tidyverse)
 library(R6)
 library(here)
+library(ggsoccer)
+library(ggforce)
 
 source(here("src", "modeling.R"))   # prepare_data()
 
@@ -57,17 +59,19 @@ preprocess_and_build_dataset <- function(df) {
   num_teams <- max(df$team_id_idx, na.rm = TRUE)
 
   # 2. Particionamento por jogada independente (sem vazamento entre frames
-  #    da mesma jogada): 60% treino, 15% validação, 25% teste
+  #    da mesma jogada): 60% treino, 15% validação, 15% calibração, 10% teste
   unique_events <- unique(df$event_id)
   n_events <- length(unique_events)
   shuffled_events <- sample(unique_events)
 
   n_train <- floor(0.60 * n_events)
   n_val <- floor(0.15 * n_events)
+  n_calib <- floor(0.15 * n_events)
 
   train_events <- shuffled_events[1:n_train]
   val_events <- shuffled_events[(n_train + 1):(n_train + n_val)]
-  test_events <- shuffled_events[(n_train + n_val + 1):n_events]
+  calib_events <- shuffled_events[(n_train + n_val + 1):(n_train + n_val + n_calib)]
+  test_events <- shuffled_events[(n_train + n_val + n_calib + 1):n_events]
 
   # 3. Escalonamento z-score ajustado APENAS no treino (t <= 25)
   cont_cols <- c('x', 'y', 'ball_speed', 'x_ball', 'y_ball', 'dist_to_ball', 'vel_x', 'vel_y')
@@ -140,9 +144,11 @@ preprocess_and_build_dataset <- function(df) {
   graph_event_ids <- sapply(graphs, function(g) g$event_id)
   train_indices <- which(graph_event_ids %in% train_events)
   val_indices <- which(graph_event_ids %in% val_events)
+  calib_indices <- which(graph_event_ids %in% calib_events)
   test_indices <- which(graph_event_ids %in% test_events)
 
   # 5. Aumento por espelhamento lateral (sempre ativo em E3)
+  #    Apenas o treino é espelhado: a calibração permanece intacta.
   scaler_ls <- list(center = scaler_center, scale = scaler_scale)
   mirrored <- lapply(graphs[train_indices], mirror_graph, scaler = scaler_ls)
   n_orig <- length(graphs)
@@ -154,6 +160,7 @@ preprocess_and_build_dataset <- function(df) {
     splits = list(
       train = train_indices,
       val = val_indices,
+      calib = calib_indices,
       test = test_indices
     ),
     num_teams = num_teams,
@@ -520,10 +527,266 @@ run_experiment <- function(df_raw, cfg) {
       scaler = scaler,
       train_dataset = train_dataset,
       val_dataset = val_dataset,
+      calib_dataset = TrajectoryDataset(graphs[splits$calib]),
       test_dataset = TrajectoryDataset(graphs[splits$test])
     )
   )
 }
 
 
+# ==========================================================================
+# 4. PREDIÇÃO CONFORME
+# ==========================================================================
+# Calibração split-conformal simultânea (Izbicki 2026 / Diquigiovanni et al.
+# 2022): o conjunto de calibração é formado por jogadas independentes (nunca
+# usadas no treino) e a forma temporal da banda s_hat_t é a mediana do erro
+# em cada horizonte; os escores são funcionais (supremo temporal) por
+# trajetória de jogador (Alvo B) e por jogada completa (Alvo A).
+calibrate_conformal <- function(model, calib_dataset, scaler, alpha = 0.10) {
+  model$eval()
+  device <- model$parameters[[1]]$device
+  ts <- mu_sd_tensors(scaler, device)
 
+  loader <- dataloader(calib_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
+  all_player_errors <- list()
+
+  with_no_grad({
+    coro::loop(for (batch in loader) {
+      batch$x_cont <- batch$x_cont$to(device = device)
+      batch$x_cat <- batch$x_cat$to(device = device)
+      batch$y <- batch$y$to(device = device)
+
+      preds <- model(batch)
+
+      # Desnormalização para coordenadas físicas reais do campo (metros)
+      preds_real <- preds * ts$sd + ts$mu
+      y_true_real <- batch$y * ts$sd + ts$mu
+
+      diff_sq <- (preds_real - y_true_real)$pow(2)
+      distances <- torch_sqrt(diff_sq$sum(dim = 3) + 1e-8) # [num_nodes, 5]
+      dist_mat <- as.matrix(distances$cpu())
+
+      all_player_errors[[length(all_player_errors) + 1]] <- dist_mat
+    })
+  })
+
+  err_matrix <- do.call(rbind, all_player_errors) # [total_trajetórias, 5]
+  n_players <- nrow(err_matrix)
+  n_events <- length(all_player_errors)
+
+  # Passo 1: Forma temporal típica do erro s_hat (mediana dos erros a cada horizonte)
+  s_hat <- apply(err_matrix, 2, median)
+  s_hat[s_hat < 1e-4] <- 1e-4
+
+  # Passo 2: Escore de não-conformidade funcional supremo (Alvo B - por trajetória de jogador)
+  # R_i = max_{t in 1:5} (e_{i,t} / s_hat_t)
+  R_player <- apply(err_matrix, 1, function(row) max(row / s_hat))
+
+  # Passo 3: Quantil conforme com garantia exata em amostra finita
+  q_level_player <- min(1.0, ceiling((n_players + 1) * (1 - alpha)) / n_players)
+  q_hat_player <- quantile(R_player, probs = q_level_player, names = FALSE)
+
+  # Raios simultâneos ao longo dos 5 segundos
+  r_simultaneous <- q_hat_player * s_hat
+
+  # Escore por jogada completa (Alvo A - todas as trajetórias contidas na banda)
+  R_event <- sapply(all_player_errors, function(mat) {
+    max(apply(mat, 1, function(row) max(row / s_hat)))
+  })
+  q_level_event <- min(1.0, ceiling((n_events + 1) * (1 - alpha)) / n_events)
+  q_hat_event <- quantile(R_event, probs = q_level_event, names = FALSE)
+  r_event <- q_hat_event * s_hat
+
+  # Quantis pontuais marginais (apenas para contraste metodológico)
+  q_pointwise <- numeric(5)
+  for (t in 1:5) {
+    q_level_pw <- min(1.0, ceiling((n_players + 1) * (1 - alpha)) / n_players)
+    q_pointwise[t] <- quantile(err_matrix[, t], probs = q_level_pw, names = FALSE)
+  }
+
+  cat(sprintf("\n=== CALIBRAÇÃO CONFORME RIGOROSA (alpha = %.2f) ===\n", alpha))
+  cat(sprintf("Amostra de Calibração: %d jogadas independentes (%d trajetórias)\n", n_events, n_players))
+  cat("Forma da banda s_hat (medianas em metros):", round(s_hat, 2), "\n")
+  cat(sprintf("Quantil Conforme Simultâneo (Alvo B): %.3f\n", q_hat_player))
+  cat("Raios Conformes Simultâneos (r_t em metros):", round(r_simultaneous, 2), "\n")
+  cat(sprintf("Quantil por Jogada Completa (Alvo A): %.3f\n", q_hat_event))
+  cat("Raios Marginais Pontuais (q_pw em metros):", round(q_pointwise, 2), "\n\n")
+
+  list(
+    s_hat = s_hat,
+    q_hat_player = q_hat_player,
+    r_simultaneous = r_simultaneous,
+    q_hat_event = q_hat_event,
+    r_event = r_event,
+    r_pointwise = q_pointwise,
+    alpha = alpha
+  )
+}
+
+# Predições com regiões conformes no teste: uma linha por (jogador, horizonte)
+# com o raio r_t da banda simultânea e a cobertura do alvo verdadeiro.
+predict_with_regions <- function(model, dataset, scaler, r_t) {
+  model$eval()
+  device <- model$parameters[[1]]$device
+  ts <- mu_sd_tensors(scaler, device)
+
+  loader <- dataloader(dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
+  results_df <- list()
+
+  with_no_grad({
+    coro::loop(for (batch in loader) {
+      evt_id <- batch$event_id
+      player_ids <- batch$player_ids
+      team_codes <- batch$team_codes
+      team_names <- batch$team_names
+
+      batch$x_cont <- batch$x_cont$to(device = device)
+      batch$x_cat <- batch$x_cat$to(device = device)
+      batch$y <- batch$y$to(device = device)
+
+      preds <- model(batch)
+
+      preds_real <- preds * ts$sd + ts$mu
+      y_true_real <- batch$y * ts$sd + ts$mu
+
+      preds_arr <- as.array(preds_real$cpu())
+      y_true_arr <- as.array(y_true_real$cpu())
+
+      num_nodes <- dim(preds_arr)[1]
+      seq_len <- dim(preds_arr)[2]
+
+      for (node in 1:num_nodes) {
+        pid <- player_ids[node]
+        tcode <- team_codes[node]
+        tname <- team_names[node]
+
+        for (t in 1:seq_len) {
+          px <- preds_arr[node, t, 1]
+          py <- preds_arr[node, t, 2]
+          tx <- y_true_arr[node, t, 1]
+          ty <- y_true_arr[node, t, 2]
+          rad <- r_t[t]
+          dist <- sqrt((px - tx)^2 + (py - ty)^2)
+
+          results_df[[length(results_df) + 1]] <- data.frame(
+            event_id = evt_id,
+            node_id = node,
+            player_id = pid,
+            team_code = tcode,
+            team_name = tname,
+            time_step = t,
+            pred_x = px,
+            pred_y = py,
+            true_x = tx,
+            true_y = ty,
+            conf_radius = rad,
+            distance = dist,
+            covered = dist <= rad,
+            stringsAsFactors = FALSE
+          )
+        }
+      }
+    })
+  })
+
+  bind_rows(results_df)
+}
+
+
+# ==========================================================================
+# 5. VISUALIZAÇÃO
+# ==========================================================================
+# Regiões conformes simultâneas de uma jogada no campo (105 x 68 m)
+plot_conformal_event <- function(target_event_id, events_prepared, test_predictions, alpha = 0.10) {
+  pred_data <- test_predictions |>
+    filter(event_id == target_event_id)
+
+  if (nrow(pred_data) == 0) {
+    stop(sprintf("Lance event_id %s não encontrado em test_predictions.", target_event_id))
+  }
+
+  valid_pids <- unique(pred_data$player_id)
+
+  # Trajetória histórica (últimos 5 frames observados t <= 25s) dos jogadores previstos
+  hist_data <- events_prepared |>
+    filter(event_id == target_event_id, time_sec <= 25, player_id %in% valid_pids) |>
+    arrange(player_id, time_sec)
+
+  p <- ggplot() +
+    # Geometria oficial do campo (105 x 68 m)
+    annotate_pitch(
+      dimensions = pitch_international,
+      fill = NA,
+      colour = "white",
+      limits = FALSE
+    ) +
+    theme_pitch() +
+    theme(
+      panel.background = element_rect(fill = "#1e222d", colour = NA),
+      plot.background = element_rect(fill = "#1e222d", colour = NA),
+      legend.background = element_rect(fill = "#1e222d", colour = NA),
+      legend.key = element_rect(fill = "#1e222d", colour = NA),
+      legend.text = element_text(color = "white", size = 9),
+      legend.title = element_text(color = "white", size = 10, face = "bold"),
+      plot.title = element_text(color = "white", size = 13, face = "bold", hjust = 0),
+      plot.subtitle = element_text(color = "#cccccc", size = 9, hjust = 0),
+      plot.margin = margin(12, 12, 12, 12)
+    ) +
+    # A. Regiões Conformes de Predição (Tubos de Incerteza)
+    geom_circle(
+      data = pred_data,
+      aes(x0 = pred_x, y0 = pred_y, r = conf_radius, fill = as.factor(time_step), group = node_id),
+      color = NA,
+      alpha = 0.18
+    ) +
+    scale_fill_viridis_d(name = "Horizonte (s)") +
+
+    # B. Histórico Observado
+    geom_path(
+      data = hist_data |> group_by(player_id) |> slice_tail(n = 5),
+      aes(x = x, y = y, group = player_id),
+      color = "white", alpha = 0.6, linewidth = 0.5, linetype = "dashed"
+    ) +
+    geom_point(
+      data = hist_data |> group_by(player_id) |> slice_tail(n = 1),
+      aes(x = x, y = y),
+      color = "white", size = 1.8, shape = 21, fill = "black"
+    ) +
+
+    # C. Trajetória Prevista pelo Modelo
+    geom_path(
+      data = pred_data,
+      aes(x = pred_x, y = pred_y, group = node_id),
+      color = "#00f5d4", linewidth = 0.9
+    ) +
+    geom_point(
+      data = pred_data,
+      aes(x = pred_x, y = pred_y, group = node_id),
+      color = "#00f5d4", size = 1.6
+    ) +
+
+    # D. Trajetória Real (Ground Truth)
+    geom_path(
+      data = pred_data,
+      aes(x = true_x, y = true_y, group = node_id),
+      color = "#ffb703", linewidth = 0.9
+    ) +
+    geom_point(
+      data = pred_data,
+      aes(x = true_x, y = true_y, group = node_id),
+      color = "#ffb703", size = 1.6
+    ) +
+
+    # Fixação de Proporção Cartesiana Real (1:1)
+    coord_fixed(
+      xlim = c(0, 105),
+      ylim = c(0, 68),
+      expand = FALSE
+    ) +
+    labs(
+      title = sprintf("Regiões Conformes Simultâneas (1 - \u03b1 = %.0f%%) | Lance %s", (1 - alpha) * 100, target_event_id),
+      subtitle = "Azul: Previsto | Amarelo: Real | Branco: Observado (t \u2264 25s) | Bandas: Regiões Conformes"
+    )
+
+  return(p)
+}

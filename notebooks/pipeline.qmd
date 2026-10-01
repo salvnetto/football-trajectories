@@ -43,6 +43,8 @@ res <- run_experiment(events_prepared, train_cfg)
 
 model <- res$model
 test_dataset <- res$test_dataset
+calib_dataset <- res$calib_dataset
+scaler <- res$scaler
 
 cat(sprintf("\nValidação: ADE %.2f m | FDE %.2f m | %d parâmetros\n",
             res$val_ade_best, res$val_fde_best, res$n_params))
@@ -79,7 +81,98 @@ evaluate_dataset <- function(model, dataset, scaler) {
   list(ADE = ade_sum / n_nodes_total, FDE = fde_sum / n_nodes_total)
 }
 
-test_metrics <- evaluate_dataset(model, test_dataset, res$scaler)
+test_metrics <- evaluate_dataset(model, test_dataset, scaler)
 cat(sprintf("Teste: ADE = %.2f m | FDE = %.2f m\n",
             test_metrics$ADE, test_metrics$FDE))
+```
+
+# Predição conforme
+
+```{r}
+# Calibração conforme no conjunto independente (sem duplo uso da validação)
+alpha_level <- 0.10
+conformal_calib <- calibrate_conformal(
+  model = model,
+  calib_dataset = calib_dataset,
+  scaler = scaler,
+  alpha = alpha_level
+)
+```
+
+```{r}
+# Inferência conforme no conjunto de teste
+test_predictions <- predict_with_regions(
+  model = model,
+  dataset = test_dataset,
+  scaler = scaler,
+  r_t = conformal_calib$r_simultaneous
+)
+
+head(test_predictions)
+```
+
+```{r}
+test_events_available <- unique(test_predictions$event_id)
+cat("Lances disponíveis no Teste:", test_events_available, "\n")
+
+sample_event_id <- test_events_available[3]
+
+conf <- plot_conformal_event(
+  target_event_id = sample_event_id,
+  events_prepared = events_prepared,
+  test_predictions = test_predictions,
+  alpha = alpha_level
+)
+
+conf
+```
+
+```{r}
+# 1. Cobertura Empírica Simultânea da Trajetória (Alvo >= 90%)
+coverage_simultaneous <- test_predictions |>
+  group_by(event_id, player_id) |>
+  summarize(trajectory_covered = all(covered), .groups = "drop") |>
+  summarize(
+    total_trajectories = n(),
+    empirical_coverage = mean(trajectory_covered)
+  )
+
+cat(sprintf("\n=== COBERTURA EMPÍRICA SIMULTÂNEA DA TRAJETÓRIA (Alvo: >= %.1f%%) ===\n", (1 - alpha_level) * 100))
+print(coverage_simultaneous)
+
+# 2. Cobertura Empírica Pontual por Segundo
+coverage_pointwise <- test_predictions |>
+  group_by(time_step) |>
+  summarize(
+    empirical_coverage = mean(covered),
+    mean_radius = mean(conf_radius),
+    .groups = "drop"
+  )
+
+cat("\n=== COBERTURA EMPÍRICA PONTUAL POR PASSO TEMPORAL ===\n")
+print(coverage_pointwise)
+
+# 3. Métricas de Deslocamento ADE e FDE por Time (Ataque vs Defesa)
+results_by_team <- test_predictions |>
+  group_by(team_code) |>
+  summarize(
+    ADE = round(mean(distance, na.rm = TRUE), 2),
+    FDE = round(mean(distance[time_step == max(time_step)], na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+cat("\n=== MÉTRICAS DE ERRO DE PREDIÇÃO POR PAPEL TÁTICO ===\n")
+print(results_by_team)
+
+# 4. Métricas ADE e FDE por Lance (Jogada)
+results_by_event <- test_predictions |>
+  group_by(event_id) |>
+  summarize(
+    ADE = round(mean(distance, na.rm = TRUE), 2),
+    FDE = round(mean(distance[time_step == max(time_step)], na.rm = TRUE), 2),
+    Coverage = round(mean(covered), 3),
+    .groups = "drop"
+  )
+
+head(results_by_event, 10)
 ```
