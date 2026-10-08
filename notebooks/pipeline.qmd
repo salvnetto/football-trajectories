@@ -7,12 +7,13 @@ source(here::here("notebooks", "architecture.R"))
 
 ```{r}
 # Configurações do experimento (sementes explícitas em todo treino)
+# RMS-prop com lr = 0.003 (Social-LSTM, Alahi et al. 2016, Sec. 3.2); tf_rate = 1.0 (teacher forcing puro, artigo)
 train_cfg <- list(
   seed = 42,
-  lr = 0.001,
+  lr = 0.003,
   max_epochs = 100,
   patience = 10,
-  weight_decay = 1e-5
+  tf_rate = 1.0
 )
 
 events <- read_csv(here('data', 'processed', 'events.csv'), show_col_types = FALSE) |>

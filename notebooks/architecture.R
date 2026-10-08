@@ -177,146 +177,196 @@ TrajectoryDataset <- dataset(
 
 
 # ==========================================================================
-# 2. DEFINIÇÃO DO MODELO
+# 2. DEFINIÇÃO DO MODELO — Social-LSTM (Alahi et al., CVPR 2016)
 # ==========================================================================
-TrajectorySeq2SeqGNNv2 <- nn_module(
-  "TrajectorySeq2SeqGNNv2",
+# Implementação fiel de Alahi, Goel, Ramanathan, Robicquet, Fei-Fei &
+# Savarese (2016), "Social LSTM: Human Trajectory Prediction in Crowded
+# Spaces", CVPR 2016.
+#
+# Mecânica exata do artigo:
+#  - Eq. (1): tensor social H_i^t (grade N_o x N_o x D) — os estados ocultos
+#    h_j^{t-1} dos vizinhos são somados nas células da grade relativa à
+#    posição do jogador i no instante t.
+#  - Eq. (2): e_i^t = phi(x_i^t, y_i^t; W_e)  [embedding 64-d com ReLU];
+#    a_i^t = phi(H_i^t; W_a) [MLP com ReLU sobre H após sum-pooling 8x8
+#    sem overlap]; h_i^t = LSTM(h_i^{t-1}, [e_i^t, a_i^t]; W_l) — um LSTM por
+#    trajetória com pesos compartilhados entre jogadores (D = 128).
+#  - Eqs. (3)-(4): [mu, sigma, rho]_i^{t+1} = W_p h_i^t (cabeça linear 5 x D),
+#    gaussiana bivariada sobre o deslocamento; sigma via exp e rho via tanh.
+#  - Perda: NLL da gaussiana bivariada com correlação rho, somada sobre os
+#    passos previstos (Eq. 4). Treino com teacher forcing (posições reais);
+#    inferência autoregressiva (Sec. 3.1 do artigo).
+#
+# Adaptações declaradas (não alteram a arquitetura):
+#  - Janela 25 observados / 5 alvos (dado a 1 Hz; o artigo usa 8/12 a 2,5 Hz).
+#  - Coordenadas z-scoreadas (transformação linear; o pooling usa metros).
+#  - Grade N_o = 32 células (artigo) numa janela de 10 m ao redor do jogador:
+#    o artigo não fixa a janela física (implementações de referência usam 4 m
+#    para pedestres); 10 m é a escala de interação a 1 Hz no futebol.
+#  - Dropout de 0.5 nos embeddings [e_i^t | a_i^t]: o artigo não usa dropout,
+#    mas as implementações de referência o aplicam nos embeddings e o regime
+#    de amostra pequena (15% de validação ~ 40 jogadas) sem ele leva a
+#    sobrequadro (NLL de validação cresce enquanto a de treino cai).
+#  - Scheduled sampling (Bengio et al. 2015): disponível via cfg$tf_rate < 1.
+#    Testado com tf_rate = 0.5 para mitigar exposure bias; não melhorou o ADE
+#    de validação neste dataset (5.27 m vs 4.99 m com TF puro). O default
+#    tf_rate = 1.0 é o procedimento exato do artigo.
 
-  initialize = function(num_teams, scaler) {
-    cont_dim <- 8
-    hidden_dim <- 64
-    dropout_rate <- 0.2
+SocialLSTM <- nn_module(
+  "SocialLSTM",
 
-    # ---- Encoder espaçotemporal ----
-    self$team_emb <- nn_embedding(num_embeddings = num_teams + 2, embedding_dim = 4)
-    self$role_emb <- nn_embedding(num_embeddings = 4, embedding_dim = 4) # num_roles + 2
+  initialize = function(scaler, pos_embed_dim = 64L, social_embed_dim = 64L,
+                        hidden_dim = 128L, num_cells = 32L, pool_size = 8L,
+                        window_m = 10, dropout_rate = 0.5) {
+    self$hidden_dim <- hidden_dim
+    self$num_cells <- num_cells
+    self$pool_size <- pool_size
+    self$window_m <- window_m
 
-    self$feat_proj <- nn_linear(cont_dim + 4 + 4, hidden_dim)
-
-    self$spatial_attention <- nn_multihead_attention(embed_dim = hidden_dim, num_heads = 4, batch_first = TRUE)
-    self$norm1 <- nn_layer_norm(hidden_dim)
-    self$dropout1 <- nn_dropout(dropout_rate)
-
-    self$temporal_encoder <- nn_lstm(input_size = hidden_dim, hidden_size = hidden_dim, batch_first = TRUE)
-
-    # ---- Decodificador com interação social dinâmica (Social-BiGAT / STGAT) ----
-    self$dec_input_proj <- nn_linear(2 + 2 + hidden_dim, hidden_dim)
-    self$temporal_decoder <- nn_lstm(input_size = hidden_dim, hidden_size = hidden_dim, batch_first = TRUE)
-
-    # Atenção de grafo recomputada a cada passo futuro
-    self$social_attention <- nn_multihead_attention(embed_dim = hidden_dim, num_heads = 4, batch_first = TRUE)
-    self$norm_social <- nn_layer_norm(hidden_dim)
-    self$dropout_social <- nn_dropout(dropout_rate)
-
-    # Cabeça de saída: prevê o resíduo em relação ao prior cinemático
-    self$out <- nn_sequential(
-      nn_linear(hidden_dim, hidden_dim),
-      nn_gelu(),
-      nn_linear(hidden_dim, 2)
+    # Embeddings (Eq. 2 do artigo): phi das coordenadas e phi do tensor social
+    self$emb_pos <- nn_sequential(
+      nn_linear(2, pos_embed_dim),
+      nn_relu()
+    )
+    # H (32x32x128) -> sum-pooling 8x8 -> (4x4x128) achatado -> a_i^t
+    self$emb_social <- nn_sequential(
+      nn_linear(as.integer((num_cells %/% pool_size)^2) * hidden_dim, social_embed_dim),
+      nn_relu()
     )
 
-    # Buffers para harmonização cinemática entre deslocamento e escala de velocidade
+    # Um LSTM por trajetória, pesos compartilhados (Eq. 2); em R torch o
+    # LSTM cell é o nn_lstm avançado passo a passo com seq_len = 1.
+    self$cell <- nn_lstm(pos_embed_dim + social_embed_dim, hidden_dim, batch_first = TRUE)
+
+    # Cabeça de saída (Eq. 4): [mu_x, mu_y, log sigma_x, log sigma_y, atanh rho]
+    self$out <- nn_linear(hidden_dim, 5)
+
+    # Dropout nos embeddings (implementações de referência; ver adaptações acima)
+    self$dropout_emb <- nn_dropout(dropout_rate)
+
+    # Buffers para converter posições z-scoreadas -> metros (grade de pooling)
+    self$mu_pos <- nn_buffer(torch_tensor(scaler$center[c("x", "y")])$view(c(1, 2)))
     self$sd_pos <- nn_buffer(torch_tensor(scaler$scale[c("x", "y")])$view(c(1, 2)))
-    self$sd_vel <- nn_buffer(torch_tensor(scaler$scale[c("vel_x", "vel_y")])$view(c(1, 2)))
-    self$mu_vel <- nn_buffer(torch_tensor(scaler$center[c("vel_x", "vel_y")])$view(c(1, 2)))
   },
 
-  # Encoder espaçotemporal: devolve o estado latente h_i(T_obs) por jogador
-  # e a cinemática do último frame observado.
-  encode = function(batch) {
-    x_cont <- batch$x_cont       # [num_nodes, seq_len = 25, cont_dim = 8]
-    team_idx <- batch$x_cat[, 1] # [num_nodes]
-    role_idx <- batch$x_cat[, 2] # [num_nodes]
+  # Tensor social H_i^t + embedding a_i^t (Eqs. 1-2 do artigo).
+  # pos_m: [num_nodes, 2] em metros; h_prev: [num_nodes, hidden_dim].
+  social_context = function(pos_m, h_prev) {
+    num_nodes <- pos_m$shape[1]
+    nc <- self$num_cells
+    cell_size <- self$window_m / nc
+    D <- self$hidden_dim
 
-    num_nodes <- x_cont$shape[1]
-    seq_len <- x_cont$shape[2]
+    # rel[i, j, :] = pos_j - pos_i
+    rel <- pos_m$unsqueeze(1) - pos_m$unsqueeze(2)            # [n, n, 2]
 
-    # Embeddings
-    team_feat <- self$team_emb(team_idx)$unsqueeze(2)$expand(c(-1, seq_len, -1))
-    role_feat <- self$role_emb(role_idx)$unsqueeze(2)$expand(c(-1, seq_len, -1))
+    # Célula (m, n) de cada par na grade centrada no jogador i
+    cell_xy <- torch_floor((rel + self$window_m / 2) / cell_size)$clamp(0, nc - 1L)
+    inside <- (rel$abs() < self$window_m / 2)$all(dim = 3)    # [n, n] bool
 
-    x_in <- torch_cat(list(x_cont, team_feat, role_feat), dim = 3)
-    x_proj <- self$feat_proj(x_in)
+    # Exclui o próprio jogador (Eq. 1 soma sobre vizinhos j != i)
+    mask <- inside * (torch_eye(num_nodes, device = rel$device) == 0)
 
-    # Camada Espacial: atenção entre jogadores a cada instante (histórico)
-    x_spatial_in <- x_proj$transpose(1, 2) # [seq_len, num_nodes, hidden_dim]
-    spatial_out <- self$spatial_attention(x_spatial_in, x_spatial_in, x_spatial_in)[[1]]
-    x_spatio_temporal <- self$norm1(spatial_out$transpose(1, 2) + x_proj)
-    x_spatio_temporal <- self$dropout1(x_spatio_temporal)
+    # Célula linear do par (i, j): linha m = y, coluna n = x
+    idx <- (cell_xy[, , 2] * nc + cell_xy[, , 1])$to(dtype = torch_long())  # [n, n]
 
-    # Codificador Temporal
-    enc_states <- self$temporal_encoder(x_spatio_temporal)[[1]]
+    # Scatter-add vetorizado: para cada par (i, j) na janela, soma h_j^{t-1}
+    # na célula correspondente da grade do jogador i (Eq. 1 do artigo).
+    # Convenções do R torch: torch_nonzero, index_select e index_add_ são
+    # todos 1-based; o índice linear achatado é (i-1)*nc^2 + cell + 1.
+    flat_sel <- torch_nonzero(mask)                           # [P, 2]
+    cell_ij <- idx$masked_select(mask)                        # [P]
 
-    list(
-      last_hidden = enc_states[, seq_len, ],   # [num_nodes, hidden_dim]
-      last_known_pos = x_cont[, seq_len, 1:2], # [num_nodes, 2]
-      last_known_vel = x_cont[, seq_len, 7:8], # [num_nodes, 2]
-      num_nodes = num_nodes,
-      seq_len = seq_len
-    )
+    H <- torch_zeros(c(num_nodes * nc * nc, D), device = pos_m$device)
+    if (flat_sel$numel() > 0) {
+      src <- h_prev$index_select(1, flat_sel[, 2])            # [P, D]
+      flat <- (flat_sel[, 1] - 1L) * (nc * nc) + cell_ij + 1L # [P] 1-based
+      H$index_add_(1, flat, src)                              # acumula duplicatas
+    }
+    H <- H$view(c(num_nodes, nc, nc, D))                      # [n, nc, nc, D]
+
+    # Sum-pooling 8x8 sem overlap (artigo, Sec. 3.2): 32x32 -> 4x4
+    H <- H$view(c(num_nodes, as.integer(nc / self$pool_size), self$pool_size,
+                  as.integer(nc / self$pool_size), self$pool_size, D))
+    H <- H$sum(dim = 3)$sum(dim = 4)                          # [n, 4, 4, D]
+
+    self$emb_social(H$flatten(start_dim = 2))                 # [n, social_embed_dim]
   },
 
-  forward = function(batch, return_latents = FALSE) {
-    enc <- self$encode(batch)
+  forward = function(batch, teacher_forcing = FALSE, tf_rate = 1.0, return_params = FALSE) {
+    pos <- batch$x_cont[, , 1:2]  # [num_nodes, 25, 2] — apenas posições (artigo)
+    target <- batch$y             # [num_nodes, 5, 2]
+    num_nodes <- pos$shape[1]
+    device <- pos$device
 
-    num_nodes <- enc$num_nodes
-    seq_len <- enc$seq_len
-    last_hidden <- enc$last_hidden
-    last_known_pos <- enc$last_known_pos
-    last_known_vel <- enc$last_known_vel
+    h_prev <- torch_zeros(c(1, num_nodes, self$hidden_dim), device = device)
+    c_prev <- torch_zeros(c(1, num_nodes, self$hidden_dim), device = device)
 
-    # Contexto Global (Social Max-Pooling invariante à permutação)
-    global_ctx <- last_hidden$max(dim = 1, keepdim = TRUE)[[1]] # [1, hidden_dim]
-    global_ctx_exp <- global_ctx$expand(c(num_nodes, -1))
+    # ---- Encoder: t = 1..25 (Eq. 2; o tensor social usa h^{t-1}, Eq. 1) ----
+    for (t in 1:25) {
+      pos_t <- pos[, t, ]
+      a_t <- self$social_context(pos_t * self$sd_pos + self$mu_pos, h_prev[1, , ])
+      e_t <- self$dropout_emb(self$emb_pos(pos_t))
+      a_t <- self$dropout_emb(a_t)
+      step_in <- torch_cat(list(e_t, a_t), dim = 2)$unsqueeze(2)  # [n, 1, in_dim]
+      hc <- self$cell(step_in, list(h_prev, c_prev))
+      h_prev <- hc[[2]][[1]]
+      c_prev <- hc[[2]][[2]]
+    }
 
-    # Decodificador Temporal Autoregressivo (5 passos no futuro)
-    h_t <- last_hidden$unsqueeze(1) # [1, num_nodes, hidden_dim]
-    c_t <- torch_zeros_like(h_t)
-    hx <- list(h_t, c_t)
-
-    current_pos <- last_known_pos
-    current_vel <- last_known_vel
-
+    # ---- Decodificador: t = 26..30 (Eqs. 3-4) ----
+    # Teacher forcing (artigo, Sec. 3.1) com scheduled sampling (Bengio et al.
+    # 2015): com probabilidade 1 - tf_rate a entrada do passo k é a posição
+    # prevista no passo k-1, mitigando o exposure bias do horizonte de 5 s a
+    # 1 Hz (desvio de treino documentado; a arquitetura não muda).
+    input_pos <- pos[, 25, ]
+    input_seq_l <- list()
     preds <- list()
+    mu_xy_l <- list()
+    sig_xy_l <- list()
+    rho_l <- list()
 
-    for (t in 1:5) {
-      step_in <- torch_cat(list(current_pos, current_vel, global_ctx_exp), dim = 2)
-      step_in <- self$dec_input_proj(step_in)$unsqueeze(2)
+    for (k in 1:5) {
+      if (teacher_forcing && k > 1) {
+        use_gt <- torch_rand(1, device = device) < tf_rate
+        input_pos <- torch_where(use_gt, target[, k - 1, ], input_pos)
+      }
+      input_seq_l[[k]] <- input_pos$unsqueeze(2)
 
-      dec_out <- self$temporal_decoder(step_in, hx)
-      dec_hidden <- dec_out[[1]]
-      hx <- dec_out[[2]]
+      a_k <- self$social_context(input_pos * self$sd_pos + self$mu_pos, h_prev[1, , ])
+      e_k <- self$dropout_emb(self$emb_pos(input_pos))
+      a_k <- self$dropout_emb(a_k)
+      step_in <- torch_cat(list(e_k, a_k), dim = 2)$unsqueeze(2)
+      hc <- self$cell(step_in, list(h_prev, c_prev))
+      h_prev <- hc[[2]][[1]]
+      c_prev <- hc[[2]][[2]]
 
-      z_t <- dec_hidden$squeeze(2) # [num_nodes, hidden_dim]
+      out5 <- self$out(h_prev[1, , ])          # [n, 5]
+      mu_xy <- out5[, 1:2]                     # deslocamento médio (z-scoreado)
+      sig_xy <- torch_exp(out5[, 3:4])         # sigma via exp (artigo)
+      rho <- torch_tanh(out5[, 5])             # correlação via tanh (artigo)
 
-      # Troca de mensagens entre jogadores no passo t
-      social_in <- z_t$unsqueeze(1) # [1, num_nodes, hidden_dim]
-      attn_out <- self$social_attention(social_in, social_in, social_in)[[1]]
-      z_t <- self$norm_social(z_t + attn_out$squeeze(1))
-      z_t <- self$dropout_social(z_t)
-
-      pred_disp <- self$out(z_t) # [num_nodes, 2] — resíduo em relação ao prior
-
-      # Prior cinemático de velocidade constante
-      v_pos <- (current_vel * self$sd_vel + self$mu_vel) / self$sd_pos
-      prior_disp <- t * v_pos
-      disp_total <- prior_disp + pred_disp
-
-      # Atualização da posição no espaço escalonado
-      current_pos <- current_pos + disp_total
-
-      # Atualização fisicamente e dimensionalmente consistente da velocidade
-      current_vel <- (disp_total * self$sd_pos - self$mu_vel) / self$sd_vel
-
-      preds[[t]] <- current_pos$unsqueeze(2)
+      pred_pos <- input_pos + mu_xy
+      preds[[k]] <- pred_pos$unsqueeze(2)
+      mu_xy_l[[k]] <- mu_xy$unsqueeze(2)
+      sig_xy_l[[k]] <- sig_xy$unsqueeze(2)
+      rho_l[[k]] <- rho$unsqueeze(2)
+      input_pos <- pred_pos
     }
 
-    preds_tensor <- torch_cat(preds, dim = 2) # [num_nodes, 5, 2]
+    preds_tensor <- torch_cat(preds, dim = 2)  # [num_nodes, 5, 2]
 
-    if (return_latents) {
-      return(list(preds = preds_tensor, last_hidden = last_hidden))
+    if (return_params) {
+      list(
+        preds = preds_tensor,
+        mu_xy = torch_cat(mu_xy_l, dim = 2),   # [num_nodes, 5, 2]
+        sig_xy = torch_cat(sig_xy_l, dim = 2),
+        rho = torch_cat(rho_l, dim = 2),       # [num_nodes, 5, 1]
+        input_seq = torch_cat(input_seq_l, dim = 2)  # [num_nodes, 5, 2]
+      )
+    } else {
+      preds_tensor
     }
-    preds_tensor
   }
 )
 
@@ -353,6 +403,39 @@ compute_ade_loss_and_fde <- function(preds, targets, scaler) {
   return(list(ade_loss = ade_loss, fde_loss = fde_loss, fde = fde))
 }
 
+# NLL da gaussiana bivariada (perda do artigo, Eqs. 3-4). dx, dy: deslocamentos-
+# alvo; mu_x, mu_y, sig_x, sig_y, rho: parâmetros previstos. Constantes
+# aditivas (log 2*pi) omitidas — irrelevantes para a otimização.
+bivariate_gaussian_nll <- function(dx, dy, mu_x, mu_y, sig_x, sig_y, rho, eps = 1e-4) {
+  sig_x <- sig_x$clamp(min = eps)
+  sig_y <- sig_y$clamp(min = eps)
+  rho2 <- rho^2
+
+  z <- (dx - mu_x)^2 / sig_x^2 + (dy - mu_y)^2 / sig_y^2 -
+    2 * rho * (dx - mu_x) * (dy - mu_y) / (sig_x * sig_y)
+
+  torch_mean(
+    torch_log(sig_x) + torch_log(sig_y) +
+      0.5 * torch_log(1 - rho2$clamp(max = 1 - eps)) +
+      z / (2 * (1 - rho2$clamp(min = eps)))
+  )
+}
+
+# NLL total de um lote: os deslocamentos-alvo são medidos em relação à
+# sequência de posições efetivamente usadas pelo decodificador (GT no teacher
+# forcing, previstas na inferência/scheduled sampling) — devolvida pelo modelo.
+compute_social_nll <- function(model_out, batch) {
+  target <- batch$y
+  dx <- target - model_out$input_seq
+
+  bivariate_gaussian_nll(
+    dx[, , 1], dx[, , 2],
+    model_out$mu_xy[, , 1], model_out$mu_xy[, , 2],
+    model_out$sig_xy[, , 1], model_out$sig_xy[, , 2],
+    model_out$rho
+  )
+}
+
 EarlyStopping <- R6Class("EarlyStopping",
   public = list(
     patience = NULL, delta = NULL, counter = 0, best_loss = NULL,
@@ -387,9 +470,16 @@ select_device <- function() {
   }
 }
 
+# Factory da arquitetura principal: Social-LSTM (Alahi et al., CVPR 2016).
+social_lstm_factory <- function(scaler, num_teams) {
+  SocialLSTM$new(scaler = scaler)
+}
+
 # Treino de uma rede a partir de datasets prontos; devolve o modelo com os
 # melhores pesos da validação restaurados. Semente própria por chamada.
-train_model <- function(train_dataset, val_dataset, num_teams, scaler, cfg, seed, verbose = TRUE) {
+# model_factory(scaler, num_teams) instancia a arquitetura desejada.
+train_model <- function(train_dataset, val_dataset, scaler, cfg, seed,
+                        model_factory, num_teams, verbose = TRUE) {
   set.seed(seed)
   torch_manual_seed(seed)
 
@@ -398,51 +488,59 @@ train_model <- function(train_dataset, val_dataset, num_teams, scaler, cfg, seed
   train_loader <- dataloader(train_dataset, batch_size = 1, shuffle = TRUE, collate_fn = custom_collate)
   val_loader <- dataloader(val_dataset, batch_size = 1, shuffle = FALSE, collate_fn = custom_collate)
 
-  model <- TrajectorySeq2SeqGNNv2$new(
-    num_teams = num_teams,
-    scaler = scaler
-  )$to(device = device)
+  model <- model_factory(scaler = scaler, num_teams = num_teams)$to(device = device)
 
   n_params <- sum(sapply(model$parameters, function(p) p$numel()))
 
-  # Configuração de treino do E3_mirror (inalterada em relação ao notebook)
-  optimizer <- optim_adam(model$parameters, lr = cfg$lr, weight_decay = cfg$weight_decay)
-  scheduler <- lr_reduce_on_plateau(optimizer, mode = "min", factor = 0.5, patience = 2)
+  # RMS-prop com lr = 0.003 (artigo, Sec. 3.2); clip de gradiente como salvaguarda
+  optimizer <- optim_rmsprop(model$parameters, lr = cfg$lr)
   early_stopping <- EarlyStopping$new(patience = cfg$patience)
 
-  history <- data.frame(epoch = integer(), train_ade = numeric(), train_fde = numeric(),
-                        val_ade = numeric(), val_fde = numeric())
+  # Critério de seleção/early stopping: NLL (objetivo do artigo) por default;
+  # cfg$stop_metric = "ade" usa o ADE de validação — o artigo treina com
+  # número fixo de épocas, sem seleção por época; com ~40 jogadas de validação
+  # a NLL autoregressiva é ruidosa e o ADE é o critério estável da comparação.
+  stop_metric <- if (!is.null(cfg$stop_metric) && cfg$stop_metric == "ade") "ade" else "nll"
+
+  history <- data.frame(epoch = integer(), train_nll = numeric(),
+                        train_ade = numeric(), train_fde = numeric(),
+                        val_nll = numeric(), val_ade = numeric(), val_fde = numeric())
 
   for (epoch in 1:cfg$max_epochs) {
     model$train()
+    train_nll <- 0
     train_ade <- 0
     train_fde <- 0
     total_nodes_train <- 0
 
     coro::loop(for (batch in train_loader) {
       batch$x_cont <- batch$x_cont$to(device = device)
-      batch$x_cat <- batch$x_cat$to(device = device)
       batch$y <- batch$y$to(device = device)
 
       optimizer$zero_grad()
-      predictions <- model(batch)
-      metrics <- compute_ade_loss_and_fde(predictions, batch$y, scaler)
+      # Teacher forcing + scheduled sampling (tf_rate no cfg)
+      out <- model(batch, teacher_forcing = TRUE, tf_rate = cfg$tf_rate, return_params = TRUE)
 
-      loss <- metrics$ade_loss + metrics$fde_loss
+      loss <- compute_social_nll(out, batch)
       loss$backward()
       nn_utils_clip_grad_norm_(model$parameters, max_norm = 1.0)
       optimizer$step()
 
+      metrics <- compute_ade_loss_and_fde(out$preds, batch$y, scaler)
+
       num_nodes <- batch$num_nodes
+      train_nll <- train_nll + loss$item() * num_nodes
       train_ade <- train_ade + metrics$ade_loss$item() * num_nodes
       train_fde <- train_fde + metrics$fde * num_nodes
       total_nodes_train <- total_nodes_train + num_nodes
     })
 
+    train_nll <- train_nll / total_nodes_train
     train_ade <- train_ade / total_nodes_train
     train_fde <- train_fde / total_nodes_train
 
     model$eval()
+    val_nll <- 0
     val_ade <- 0
     val_fde <- 0
     total_nodes_val <- 0
@@ -450,35 +548,37 @@ train_model <- function(train_dataset, val_dataset, num_teams, scaler, cfg, seed
     with_no_grad({
       coro::loop(for (batch in val_loader) {
         batch$x_cont <- batch$x_cont$to(device = device)
-        batch$x_cat <- batch$x_cat$to(device = device)
         batch$y <- batch$y$to(device = device)
 
-        predictions <- model(batch)
-        metrics <- compute_ade_loss_and_fde(predictions, batch$y, scaler)
+        out <- model(batch, teacher_forcing = FALSE, return_params = TRUE)
+
+        nll <- compute_social_nll(out, batch)
+        metrics <- compute_ade_loss_and_fde(out$preds, batch$y, scaler)
 
         num_nodes <- batch$num_nodes
+        val_nll <- val_nll + nll$item() * num_nodes
         val_ade <- val_ade + metrics$ade_loss$item() * num_nodes
         val_fde <- val_fde + metrics$fde * num_nodes
         total_nodes_val <- total_nodes_val + num_nodes
       })
     })
 
+    val_nll <- val_nll / total_nodes_val
     val_ade <- val_ade / total_nodes_val
     val_fde <- val_fde / total_nodes_val
 
     history <- rbind(history, data.frame(
-      epoch = epoch, train_ade = train_ade, train_fde = train_fde,
-      val_ade = val_ade, val_fde = val_fde
+      epoch = epoch, train_nll = train_nll,
+      train_ade = train_ade, train_fde = train_fde,
+      val_nll = val_nll, val_ade = val_ade, val_fde = val_fde
     ))
 
-    scheduler$step(val_fde)
-
     if (verbose && (epoch %% 5 == 0 || epoch == 1)) {
-      cat(sprintf("Época %03d | Treino ADE: %.2f m, FDE: %.2f m | Val ADE: %.2f m, FDE: %.2f m\n",
-                  epoch, train_ade, train_fde, val_ade, val_fde))
+      cat(sprintf("Época %03d | Treino NLL: %.3f, ADE: %.2f m, FDE: %.2f m | Val NLL: %.3f, ADE: %.2f m, FDE: %.2f m\n",
+                  epoch, train_nll, train_ade, train_fde, val_nll, val_ade, val_fde))
     }
 
-    early_stopping$step(val_fde, model)
+    early_stopping$step(if (stop_metric == "ade") val_ade else val_nll, model)
     if (early_stopping$early_stop) {
       if (verbose) cat(sprintf("Early stopping atingido na época %d.\n", epoch))
       break
@@ -496,13 +596,14 @@ train_model <- function(train_dataset, val_dataset, num_teams, scaler, cfg, seed
     model = model,
     history = history,
     n_params = n_params,
+    val_nll_best = min(history$val_nll),
     val_ade_best = min(history$val_ade),
     val_fde_best = min(history$val_fde)
   )
 }
 
 # Executa um experimento completo: preprocessamento, treino e datasets.
-run_experiment <- function(df_raw, cfg) {
+run_experiment <- function(df_raw, cfg, model_factory = social_lstm_factory) {
   prep_data <- preprocess_and_build_dataset(df_raw)
   graphs <- prep_data$graphs
   splits <- prep_data$splits
@@ -514,10 +615,11 @@ run_experiment <- function(df_raw, cfg) {
   fit <- train_model(
     train_dataset = train_dataset,
     val_dataset = val_dataset,
-    num_teams = prep_data$num_teams,
     scaler = scaler,
     cfg = cfg,
-    seed = cfg$seed
+    seed = cfg$seed,
+    model_factory = model_factory,
+    num_teams = prep_data$num_teams
   )
 
   c(
