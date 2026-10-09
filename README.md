@@ -1,0 +1,2 @@
+- Ajustar arquitetura
+- Ajustar codigo (1 arquitetura.R (onde tem a rede), 3 arquivos de conformal (onde tem o baseline, 1-3 e 4-6), um pipeline onde escolhe qual dos conformes rodar, todas os conformal irao ter elipse e circulo?)
